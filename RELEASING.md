@@ -6,7 +6,7 @@ source host and release artifact store; it is not an npm registry.
 | Consumer | Pin |
 | --- | --- |
 | Nacre | Tagged source commit through `vendor/agent-bridge` |
-| Lumen Next | `agent-bridge-linux-x64` from the same tagged GitHub Release |
+| Lumen Next local development / POC | `agent-bridge-linux-x64` from the same tagged GitHub Release |
 
 ## Version policy
 
@@ -41,8 +41,8 @@ Never move or reuse a release tag. Publish a new patch version instead.
    ```
 
 6. Wait for the release workflow to publish the Linux executable and checksum.
-7. Update Nacre's submodule and the Lumen deployment release pin, then run
-   each consumer's bridge smoke test.
+7. Update Nacre's submodule and any Lumen development/POC release pin, then
+   run each consumer's bridge smoke test.
 
 ## Consumer pinning
 
@@ -66,7 +66,8 @@ bun install
 git add vendor/agent-bridge bun.lock
 ```
 
-Lumen deployment downloads and verifies the executable:
+Lumen local development or a temporary POC downloads and verifies the
+executable:
 
 ```sh
 gh release download v0.1.0 \
@@ -78,9 +79,12 @@ install -m 0755 agent-bridge-linux-x64 \
   /opt/agent-bridge/releases/v0.1.0/agent-bridge
 ```
 
-One loopback service may serve multiple Lumen instances only when they share
+One loopback service may serve multiple development/POC Lumen instances only
+when they share
 the same machine, OS user, provider subscriptions, trust boundary, and upgrade
 schedule. Separate any boundary mismatch with another service and port.
+Production Lumen uses an API-key-authenticated managed provider or customer
+gateway, not personal coding-agent subscriptions.
 
 Private-repository consumers and deployment jobs need GitHub read access
 through an SSH key, PAT, GitHub App, or Actions token.
@@ -88,5 +92,6 @@ through an SSH key, PAT, GitHub App, or Actions token.
 ## When to add GitHub Packages
 
 Stay with tagged source and release executables while Nacre bundles source and
-Lumen runs a service. Add a private GitHub npm package only when another
-consumer needs package-manager resolution and compiled JavaScript imports.
+Lumen uses a local development service. Add a private GitHub npm package only
+when another consumer needs package-manager resolution and compiled JavaScript
+imports.

@@ -60,13 +60,13 @@ release tags rather than an npm registry.
 
 | Consumer | Distribution | Lifecycle |
 | --- | --- | --- |
-| Nacre | Git submodule pinned to an exact tag | Bundled and supervised by the desktop app |
-| Lumen Next | Linux executable from the matching GitHub Release | Shared loopback service managed by systemd |
+| Nacre | Git submodule pinned to an exact tag | Bundled into the personal desktop product |
+| Lumen Next development | Linux executable from the matching GitHub Release | Local loopback service; not a production provider |
 
 Nacre imports the tagged source through
 `"@aotterclam/agent-bridge": "file:vendor/agent-bridge"`. Lumen does not
-install the package: deployment downloads `agent-bridge-linux-x64` from the
-private release and runs it as a separate service. See
+install the package: local development downloads `agent-bridge-linux-x64` from
+the private release and runs it as a separate service. See
 [RELEASING.md](./RELEASING.md) for the release and pinning rules.
 
 ## Standalone mode
@@ -130,7 +130,7 @@ Both modes expose the same protocol and adapter behavior. Standalone mode is
 usually the cleaner boundary for a desktop application because process
 lifecycle and agent dependencies remain outside the UI process.
 
-### Shared Lumen service
+### Shared Lumen development service
 
 Multiple Lumen instances may share one standalone bridge when they run on the
 same machine and have the same OS user, provider subscriptions, trust
@@ -150,6 +150,10 @@ across restarts while the control token is unchanged.
 
 Use another process and port when OS users, customer data, provider accounts,
 or release cadence differ.
+
+Do not use personal Claude Code or Codex subscriptions as a production Lumen
+backend. Production Lumen must use an API-key-authenticated managed provider or
+customer gateway. Existing shared VM demos are temporary POC deployments.
 
 ## Capability discovery
 
@@ -259,8 +263,10 @@ backend and bridge process.
 ## Safety and policy
 
 This package is intended for personal use on the same machine as the host
-application. It binds to loopback and must not be exposed through a public
-listener, reverse proxy, tunnel, or remote port forward.
+application. Nacre may include it in the released personal desktop product;
+Lumen may use it only for local development or temporary POCs. It binds to
+loopback and must not be exposed through a public listener, reverse proxy,
+tunnel, or remote port forward.
 
 The package uses credentials and subscriptions already configured by the
 official Claude and Codex clients. Users and integrators are responsible for
