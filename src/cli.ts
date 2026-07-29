@@ -1,6 +1,11 @@
 #!/usr/bin/env bun
 
-import { listen } from "./index.js";
+export {};
+
+const entry = process.argv[1];
+process.argv[1] = "agent-bridge";
+const { listen } = await import("./index.js");
+process.argv[1] = entry;
 
 const bridge = await listen();
 console.log(
