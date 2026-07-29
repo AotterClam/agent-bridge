@@ -55,8 +55,23 @@ agent-bridge on 127.0.0.1
 - Claude Code signed in for the Claude adapter
 - Codex CLI signed in for the Codex adapter
 
-The package is currently private. Consume it from this repository, a Git
-submodule, or a workspace dependency.
+The package is currently private and distributed through immutable GitHub
+release tags rather than an npm registry. Consumers must pin an exact tag:
+
+```sh
+bun add git+ssh://git@github.com/AotterClam/agent-bridge.git#v0.1.0
+```
+
+```ts
+import {
+  createAgentBridge,
+  listen,
+} from "@aotterclam/agent-bridge";
+```
+
+Nacre vendors the same tagged commit as a Git submodule because its desktop
+build bundles the bridge source. See [RELEASING.md](./RELEASING.md) for the
+version policy, release checklist, and consumer pinning rules.
 
 ## Standalone mode
 
