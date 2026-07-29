@@ -26,18 +26,21 @@ or endorsed by Anthropic or OpenAI.
 
 ## Host integration
 
-```ts
-import { createAgentBridge } from "@aotterclam/agent-bridge";
+Run it as a supervised local process:
 
-const bridge = createAgentBridge();
-const capabilities = await bridge.capabilities();
-const connection = bridge.connection("claude", "http://127.0.0.1:5750/local-agent/v1");
-
-// Mount bridge.handle() at:
-// GET  /local-agent/health
-// GET  /local-agent/v1/models
-// POST /local-agent/v1/chat/completions
+```sh
+AGENT_BRIDGE_CONTROL_TOKEN=... agent-bridge
 ```
 
-`connection.apiKey` is an opaque capability token. Adapter identity is never
-encoded in the public URL or native model ID.
+Or embed its lifecycle in a Bun host:
+
+```ts
+import { createAgentBridge, listen } from "@aotterclam/agent-bridge";
+
+const bridge = await listen(createAgentBridge(), 3457);
+process.once("exit", () => void bridge.close());
+```
+
+The host obtains adapter status and opaque capability tokens from
+`GET /capabilities`. Adapter identity is never encoded in the public URL or
+native model ID.
