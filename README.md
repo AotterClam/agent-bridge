@@ -56,22 +56,18 @@ agent-bridge on 127.0.0.1
 - Codex CLI signed in for the Codex adapter
 
 The package is currently private and distributed through immutable GitHub
-release tags rather than an npm registry. Consumers must pin an exact tag:
+release tags rather than an npm registry.
 
-```sh
-bun add git+ssh://git@github.com/AotterClam/agent-bridge.git#v0.1.0
-```
+| Consumer | Distribution | Lifecycle |
+| --- | --- | --- |
+| Nacre | Git submodule pinned to an exact tag | Bundled and supervised by the desktop app |
+| Lumen Next | Linux executable from the matching GitHub Release | Shared loopback service managed by systemd |
 
-```ts
-import {
-  createAgentBridge,
-  listen,
-} from "@aotterclam/agent-bridge";
-```
-
-Nacre vendors the same tagged commit as a Git submodule because its desktop
-build bundles the bridge source. See [RELEASING.md](./RELEASING.md) for the
-version policy, release checklist, and consumer pinning rules.
+Nacre imports the tagged source through
+`"@aotterclam/agent-bridge": "file:vendor/agent-bridge"`. Lumen does not
+install the package: deployment downloads `agent-bridge-linux-x64` from the
+private release and runs it as a separate service. See
+[RELEASING.md](./RELEASING.md) for the release and pinning rules.
 
 ## Standalone mode
 
@@ -133,6 +129,27 @@ process.once("exit", () => void bridge.close());
 Both modes expose the same protocol and adapter behavior. Standalone mode is
 usually the cleaner boundary for a desktop application because process
 lifecycle and agent dependencies remain outside the UI process.
+
+### Shared Lumen service
+
+Multiple Lumen instances may share one standalone bridge when they run on the
+same machine and have the same OS user, provider subscriptions, trust
+boundary, and upgrade schedule. Keep the service on loopback:
+
+```ini
+[Service]
+EnvironmentFile=/opt/agent-bridge/env/bridge.env
+ExecStart=/opt/agent-bridge/current/agent-bridge
+Restart=on-failure
+```
+
+Each Lumen deployment calls `/capabilities` with the bridge control token and
+uses the selected adapter's capability token as `LUMEN_LLM_API_KEY`, with
+`LUMEN_LLM_BASE_URL=http://127.0.0.1:3457/v1`. Capability tokens remain stable
+across restarts while the control token is unchanged.
+
+Use another process and port when OS users, customer data, provider accounts,
+or release cadence differ.
 
 ## Capability discovery
 

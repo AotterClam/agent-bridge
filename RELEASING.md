@@ -1,7 +1,12 @@
 # Releasing
 
 `agent-bridge` is distributed from this private Git repository. GitHub is the
-source host; it is not currently used as an npm registry.
+source host and release artifact store; it is not an npm registry.
+
+| Consumer | Pin |
+| --- | --- |
+| Nacre | Tagged source commit through `vendor/agent-bridge` |
+| Lumen Next | `agent-bridge-linux-x64` from the same tagged GitHub Release |
 
 ## Version policy
 
@@ -35,33 +40,16 @@ Never move or reuse a release tag. Publish a new patch version instead.
    git push origin main v0.1.0
    ```
 
-6. Create the GitHub release:
-
-   ```sh
-   gh release create v0.1.0 \
-     --repo AotterClam/agent-bridge \
-     --verify-tag \
-     --generate-notes
-   ```
-
-7. Update each consumer to the tagged commit and run its bridge smoke test.
+6. Wait for the release workflow to publish the Linux executable and checksum.
+7. Update Nacre's submodule and the Lumen deployment release pin, then run
+   each consumer's bridge smoke test.
 
 ## Consumer pinning
 
 Applications must pin an exact release tag. Do not depend on `main`.
 
-For a normal Bun dependency:
-
-```json
-{
-  "dependencies": {
-    "@aotterclam/agent-bridge": "git+ssh://git@github.com/AotterClam/agent-bridge.git#v0.1.0"
-  }
-}
-```
-
-For a source-bundling desktop app such as Nacre, keep the Git submodule on the
-release commit and import it through a local package dependency:
+Nacre keeps the Git submodule on the release commit and imports it through a
+local package dependency:
 
 ```json
 {
@@ -78,13 +66,27 @@ bun install
 git add vendor/agent-bridge bun.lock
 ```
 
-Private-repository consumers need GitHub read access through their developer
-SSH key or CI credential.
+Lumen deployment downloads and verifies the executable:
+
+```sh
+gh release download v0.1.0 \
+  --repo AotterClam/agent-bridge \
+  --pattern agent-bridge-linux-x64 \
+  --pattern agent-bridge-linux-x64.sha256
+sha256sum -c agent-bridge-linux-x64.sha256
+install -m 0755 agent-bridge-linux-x64 \
+  /opt/agent-bridge/releases/v0.1.0/agent-bridge
+```
+
+One loopback service may serve multiple Lumen instances only when they share
+the same machine, OS user, provider subscriptions, trust boundary, and upgrade
+schedule. Separate any boundary mismatch with another service and port.
+
+Private-repository consumers and deployment jobs need GitHub read access
+through an SSH key, PAT, GitHub App, or Actions token.
 
 ## When to add GitHub Packages
 
-Stay with tagged Git dependencies while consumers use Bun and need the source
-for bundling. Add a private GitHub npm package only when independent consumers
-need registry version ranges, automated dependency updates, or compiled
-Node.js artifacts. That change also requires a `dist` build, declarations,
-`publishConfig`, package-access policy, and authenticated release workflow.
+Stay with tagged source and release executables while Nacre bundles source and
+Lumen runs a service. Add a private GitHub npm package only when another
+consumer needs package-manager resolution and compiled JavaScript imports.

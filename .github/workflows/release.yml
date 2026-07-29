@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
+      - name: Verify version
+        run: test "${GITHUB_REF_NAME#v}" = "$(bun -p 'require("./package.json").version')"
+      - name: Build standalone bridge
+        run: |
+          mkdir -p dist
+          bun build --compile src/cli.ts --outfile dist/agent-bridge-linux-x64
+          sha256sum dist/agent-bridge-linux-x64 > dist/agent-bridge-linux-x64.sha256
+      - name: Smoke standalone bridge
+        run: |
+          AGENT_BRIDGE_PORT=3469 AGENT_BRIDGE_CONTROL_TOKEN=smoke \
+            dist/agent-bridge-linux-x64 >/tmp/agent-bridge.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:3469/health; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          test "${ready:-}" = 1 || {
+            cat /tmp/agent-bridge.log
+            exit 1
+          }
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
