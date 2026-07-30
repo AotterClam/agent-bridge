@@ -35,6 +35,14 @@ async function* idlePrompt(signal) {
   });
 }
 
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+/** Effort levels the SDK reports for one model, in canonical order. */
+function effortLevels({ supportsEffort, supportedEffortLevels }) {
+  if (supportsEffort === false || !Array.isArray(supportedEffortLevels)) return [];
+  return EFFORT_LEVELS.filter((level) => supportedEffortLevels.includes(level));
+}
+
 export async function discoverClaudeModels(options = {}) {
   const controller = new AbortController();
   const queryFn = options.queryFn ?? claudeQuery;
@@ -72,6 +80,10 @@ export async function discoverClaudeModels(options = {}) {
         id,
         name: id,
         description: model.description,
+        // Effort is per-model and the SDK reports it. Reporting a fixed empty
+        // list told hosts every Claude model was unconfigurable, which left
+        // their effort pickers dead.
+        reasoningEfforts: effortLevels(model),
         ...(alias ? { aliases: [alias] } : {}),
       });
     }
@@ -264,7 +276,12 @@ export function streamEventDelta(event, toolCallIndexes = new Map()) {
   if (event.type === "content_block_delta") {
     if (event.delta.type === "text_delta") return { content: event.delta.text };
     if (event.delta.type === "thinking_delta") {
-      return { reasoning_content: event.delta.thinking };
+      // Some models stream a thinking block's signature while withholding its
+      // text, so `thinking` arrives as "". Forwarding that claims reasoning is
+      // present when there is nothing to show.
+      return event.delta.thinking
+        ? { reasoning_content: event.delta.thinking }
+        : undefined;
     }
     if (event.delta.type === "input_json_delta") {
       return {
@@ -342,6 +359,9 @@ export async function runClaudeTurn(input, options = {}) {
       strictMcpConfig: true,
       includePartialMessages: true,
       abortController: controller,
+      // Adaptive thinking is already the SDK default, so `thinking` is left
+      // alone; effort is the knob a host can actually ask for.
+      ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}),
       ...(mcpServer ? { mcpServers: { openai: mcpServer } } : {}),
       ...(sdkTools.length
         ? { allowedTools: tools.map((item) => `${TOOL_PREFIX}${item.function.name}`) }

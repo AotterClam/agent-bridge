@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { once } from "node:events";
 import {
   createBridgeServer,
-  runClaudeTurn
+  discoverClaudeModels,
+  runClaudeTurn,
+  streamEventDelta
 } from "../src/claude-bridge.mjs";
 
 const servers: Array<ReturnType<typeof createBridgeServer>> = [];
@@ -32,6 +34,83 @@ function abortedQuery({ options }: any) {
     { close() {} }
   );
 }
+
+function capturingQuery(seen: { options?: any }) {
+  return ({ options }: any) => {
+    seen.options = options;
+    return Object.assign(
+      (async function* () {
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          message: { content: [{ type: "text", text: "ok" }] }
+        };
+      })(),
+      { close() {} }
+    );
+  };
+}
+
+test("advertises the effort levels the SDK reports for each model", async () => {
+  const models = await discoverClaudeModels({
+    queryFn: () =>
+      Object.assign((async function* () {})(), {
+        close() {},
+        supportedModels: async () => [
+          // Out of order, with an unknown level.
+          {
+            value: "opus",
+            resolvedModel: "claude-opus-5",
+            supportsEffort: true,
+            supportedEffortLevels: ["max", "nonsense", "low", "high"]
+          },
+          // Metadata predating the effort fields. Silence is not permission:
+          // effort had no reproducible effect here when measured, so the list
+          // stays empty rather than advertising a knob.
+          { value: "haiku", resolvedModel: "claude-haiku-4-5" },
+          {
+            value: "opted-out",
+            resolvedModel: "claude-opted-out",
+            supportsEffort: false,
+            supportedEffortLevels: ["low", "high"]
+          }
+        ]
+      })
+  });
+
+  expect(
+    models.map(({ id, reasoningEfforts }: any) => [id, reasoningEfforts])
+  ).toEqual([
+    ["claude-opus-5", ["low", "high", "max"]],
+    ["claude-haiku-4-5", []],
+    ["claude-opted-out", []]
+  ]);
+});
+
+test("forwards a requested effort to the Claude SDK", async () => {
+  const requested: { options?: any } = {};
+  await runClaudeTurn(
+    { ...input, reasoning_effort: "max" },
+    { queryFn: capturingQuery(requested) }
+  );
+  expect(requested.options.effort).toBe("max");
+
+  const unset: { options?: any } = {};
+  await runClaudeTurn(input, { queryFn: capturingQuery(unset) });
+  expect(unset.options).not.toHaveProperty("effort");
+});
+
+test("does not report reasoning when a model withholds its thinking text", () => {
+  const thinking = (text: string) => ({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "thinking_delta", thinking: text }
+  });
+  expect(streamEventDelta(thinking(""))).toBeUndefined();
+  expect(streamEventDelta(thinking("weighing it"))).toEqual({
+    reasoning_content: "weighing it"
+  });
+});
 
 test("reports a turn timeout instead of a user abort", async () => {
   await expect(
