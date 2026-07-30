@@ -1,6 +1,6 @@
 {
   "name": "@aotterclam/agent-bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local OpenAI-compatible bridge for official coding-agent runtimes",
   "license": "MIT",
   "repository": {

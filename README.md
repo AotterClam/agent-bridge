@@ -8,7 +8,7 @@ Credentials stay with the official local clients.
 
 | Adapter | Official integration | Text | Reasoning | Tools |
 | --- | --- | --- | --- | --- |
-| Claude Code | `@anthropic-ai/claude-agent-sdk` | Streaming | Streaming | Yes |
+| Claude Code | `@anthropic-ai/claude-agent-sdk` | Streaming | Streaming, model-dependent | Yes |
 | Codex | `codex app-server` | Streaming | Streaming | Yes |
 
 Antigravity is not supported until Google publishes an official embeddable
@@ -69,6 +69,34 @@ POST /v1/chat/completions
 
 Chat completions support regular and SSE responses, reasoning deltas when
 provided by the adapter, and OpenAI function-tool calls.
+
+## Reasoning effort and reasoning visibility
+
+Two independent capabilities. `reasoning_effort` is forwarded to the adapter
+(Claude SDK `effort`, Codex reasoning level); whether the model then *shows* its
+reasoning is separate and not the bridge's to control. `GET /capabilities`
+reports `reasoningEfforts` per model from each runtime's own metadata. Codex
+also reports a per-model default; the Claude SDK does not, so
+`defaultReasoningEffort` is absent there.
+
+Measured 2026-07-30 (claude-agent-sdk 0.3.220, codex-cli 0.144.4):
+
+| Model | `reasoningEfforts` | Reasoning text streamed |
+| --- | --- | --- |
+| claude-opus-5, claude-fable-5 | low – max | No, `thinking` arrives empty |
+| claude-sonnet-5 | low – max | Not observed |
+| claude-haiku-4-5 | none reported | **Yes** |
+| gpt-5.6-\* | low – max | Yes |
+| gpt-5.2 – gpt-5.5 | low – xhigh | Yes |
+
+Opus 5 accepts every effort level and shows no reasoning text; Haiku 4.5 is the
+reverse, so a host cannot infer one capability from the other. Models that
+withhold the text still stream a thinking block signature with `thinking` as
+`""`; the bridge drops those rather than emitting `reasoning_content: ""`.
+
+A model whose metadata is silent about effort gets an empty list. Passing
+`effort` to Haiku 4.5 produced no reproducible change in thinking length across
+repeated runs, so silence is treated as unsupported rather than assumed to work.
 
 ## Embed
 

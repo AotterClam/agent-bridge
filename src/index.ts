@@ -43,10 +43,12 @@ async function detectClaude(): Promise<AdapterCapability> {
       available: models.length > 0,
       version: null,
       error: models.length ? null : "Claude Agent SDK returned no models.",
-      models: models.map((model: { id: string; name: string }) => ({
+      // Unlike Codex, the SDK names no per-model default effort, so
+      // `defaultReasoningEffort` stays unset rather than invented.
+      models: models.map((model: AdapterCapability["models"][number]) => ({
         id: model.id,
         name: model.name,
-        reasoningEfforts: []
+        reasoningEfforts: model.reasoningEfforts ?? []
       }))
     };
   } catch (error) {
