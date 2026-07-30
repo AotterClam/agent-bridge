@@ -1,11 +1,53 @@
 import { afterEach, expect, test } from "bun:test";
 import { once } from "node:events";
-import { createBridgeServer } from "../src/claude-bridge.mjs";
+import {
+  createBridgeServer,
+  runClaudeTurn
+} from "../src/claude-bridge.mjs";
 
 const servers: Array<ReturnType<typeof createBridgeServer>> = [];
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((bridge) => bridge.close()));
+});
+
+const input = {
+  model: "claude-sonnet",
+  messages: [{ role: "user", content: "Hello" }],
+  tools: [],
+  tool_choice: "auto"
+};
+
+function abortedQuery({ options }: any) {
+  return Object.assign(
+    (async function* () {
+      await new Promise<void>((resolve) => {
+        if (options.abortController.signal.aborted) resolve();
+        else options.abortController.signal.addEventListener("abort", resolve, {
+          once: true
+        });
+      });
+      throw new Error("Claude Code process aborted by user");
+    })(),
+    { close() {} }
+  );
+}
+
+test("reports a turn timeout instead of a user abort", async () => {
+  await expect(
+    runClaudeTurn(input, { queryFn: abortedQuery, timeoutMs: 5 })
+  ).rejects.toThrow("Claude turn timed out after 5 ms.");
+});
+
+test("distinguishes an upstream cancellation from a timeout", async () => {
+  const controller = new AbortController();
+  const turn = runClaudeTurn(input, {
+    queryFn: abortedQuery,
+    signal: controller.signal,
+    timeoutMs: 60_000
+  });
+  controller.abort();
+  await expect(turn).rejects.toThrow("Claude turn cancelled.");
 });
 
 test("keeps the lumen-next OpenAI streaming contract", async () => {
