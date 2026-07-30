@@ -14,7 +14,7 @@ const DEFAULT_PORT = 3457;
 const DEFAULT_TOKEN = "dev-only";
 const TOOL_PREFIX = "mcp__openai__";
 // The bridge translates one OpenAI-compatible model call into exactly one
-// Claude SDK assistant turn. Lumen's outer runtime owns the configurable
+// Claude SDK assistant turn. The host runtime owns the configurable
 // agent-step budget; this is not a product thread or user-turn limit.
 const BRIDGE_SDK_TURN_BUDGET = 1;
 
