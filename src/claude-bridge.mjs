@@ -13,10 +13,20 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PORT = 3457;
 const DEFAULT_TOKEN = "dev-only";
 const TOOL_PREFIX = "mcp__openai__";
+const DEFAULT_TURN_TIMEOUT_MS = 300_000;
 // The bridge translates one OpenAI-compatible model call into exactly one
 // Claude SDK assistant turn. The host runtime owns the configurable
 // agent-step budget; this is not a product thread or user-turn limit.
 const BRIDGE_SDK_TURN_BUDGET = 1;
+
+function turnTimeoutMs(value = process.env.AGENT_BRIDGE_CLAUDE_TIMEOUT_MS) {
+  if (value === undefined) return DEFAULT_TURN_TIMEOUT_MS;
+  const timeout = Number(value);
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new Error("AGENT_BRIDGE_CLAUDE_TIMEOUT_MS must be a positive integer");
+  }
+  return timeout;
+}
 
 async function* idlePrompt(signal) {
   await new Promise((resolve) => {
@@ -307,13 +317,19 @@ export async function runClaudeTurn(input, options = {}) {
       })
     : undefined;
   const controller = new AbortController();
-  const forwardAbort = () => controller.abort();
+  const timeoutMs = turnTimeoutMs(options.timeoutMs);
+  let abortCause;
+  const forwardAbort = () => {
+    abortCause ??= "upstream";
+    controller.abort(options.signal?.reason);
+  };
   if (options.signal?.aborted) forwardAbort();
   else options.signal?.addEventListener("abort", forwardAbort, { once: true });
-  const timer = setTimeout(
-    () => controller.abort(),
-    options.timeoutMs ?? 120_000,
-  );
+  const timer = setTimeout(() => {
+    abortCause ??= "timeout";
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
   const queryFn = options.queryFn ?? claudeQuery;
   const stream = queryFn({
     prompt: promptFor(input.messages, input.tool_choice),
@@ -358,6 +374,14 @@ export async function runClaudeTurn(input, options = {}) {
     }
     if (!sawAssistant) throw new Error("Claude bridge returned no assistant turn");
     return { content: content || null, toolCalls: [], finishReason: "stop" };
+  } catch (error) {
+    if (abortCause === "timeout") {
+      throw new Error(`Claude turn timed out after ${timeoutMs} ms.`);
+    }
+    if (abortCause === "upstream") {
+      throw new Error("Claude turn cancelled.");
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener("abort", forwardAbort);
@@ -521,6 +545,8 @@ export function createClaudeHandler(options = {}) {
       );
       const controller = new AbortController();
       active.add(controller);
+      const startedAt = performance.now();
+      const activeAtStart = active.size;
       request.once("aborted", () => controller.abort());
       response.once("close", () => {
         if (!response.writableEnded) controller.abort();
@@ -546,6 +572,15 @@ export function createClaudeHandler(options = {}) {
         }
       } finally {
         active.delete(controller);
+        console.info(
+          "[agent-bridge.claude]",
+          JSON.stringify({
+            event: "request-finished",
+            durationMs: Math.round(performance.now() - startedAt),
+            activeAtStart,
+            activeRemaining: active.size,
+          }),
+        );
       }
     } catch (error) {
       const status = error?.status ?? 500;
