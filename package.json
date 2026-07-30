@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AotterClam/agent-bridge.git"
+    "url": "git+https://github.com/AotterClam/agent-bridge.git"
   },
   "bugs": "https://github.com/AotterClam/agent-bridge/issues",
   "engines": {
@@ -20,7 +20,7 @@
     "./cli": "./src/cli.ts"
   },
   "bin": {
-    "agent-bridge": "./src/cli.ts"
+    "agent-bridge": "src/cli.ts"
   },
   "publishConfig": {
     "access": "public",
