@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -32,27 +32,15 @@ function command() {
   return process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex";
 }
 
-function safeEnv(home: string) {
-  const env: Record<string, string> = { HOME: home, CODEX_HOME: join(home, ".codex") };
+export function codexEnvironment(home: string) {
+  const env: Record<string, string> = {
+    HOME: home,
+    CODEX_HOME: process.env.CODEX_HOME ?? join(homedir(), ".codex")
+  };
   for (const key of ["PATH", "SHELL", "TMPDIR", "TEMP", "TMP", "USER", "LANG", "LC_ALL"]) {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
-}
-
-async function isolatedCodexHome(root: string) {
-  const home = join(root, ".codex");
-  await mkdir(home, { recursive: true });
-  try {
-    const auth = join(home, "auth.json");
-    await copyFile(join(homedir(), ".codex", "auth.json"), auth);
-    await chmod(auth, 0o600);
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-      throw error;
-    }
-  }
-  return safeEnv(root);
 }
 
 function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMessage) => void) {
@@ -171,7 +159,7 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
       "app-server",
       "--stdio"
     ],
-    { cwd, env: await isolatedCodexHome(cwd), stdio: ["pipe", "pipe", "pipe"] }
+    { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
   );
   let content = "";
   let stderr = "";

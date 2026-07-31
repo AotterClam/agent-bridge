@@ -131,8 +131,9 @@ in memory; do not write them to logs, analytics, or project files.
 ## Safety
 
 The bridge binds to loopback and uses credentials already configured by the
-official Claude and Codex clients. Do not expose it through a public listener,
-reverse proxy, tunnel, or remote port forward.
+official Claude and Codex clients. Codex turns use the configured `CODEX_HOME`
+so the official client can persist credential rotation. Do not expose the
+bridge through a public listener, reverse proxy, tunnel, or remote port forward.
 
 Users are responsible for complying with provider, employer, and customer
 policies. This project is not affiliated with or endorsed by Anthropic or

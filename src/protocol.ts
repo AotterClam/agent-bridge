@@ -149,23 +149,6 @@ export function selectedTools(input: ChatRequest) {
   return input.tools;
 }
 
-function validateChoice(input: ChatRequest, turn: ChatTurn) {
-  const choice = input.tool_choice;
-  const names = turn.toolCalls.map(({ name }) => name);
-  if (choice === "none" && names.length) {
-    throw new Error("Agent called a tool while tool_choice was none");
-  }
-  if (choice === "required" && !names.length) {
-    throw new Error("Agent did not call a required tool");
-  }
-  if (
-    typeof choice === "object" &&
-    (!names.length || names.some((name) => name !== choice.function.name))
-  ) {
-    throw new Error(`Agent did not call ${choice.function.name}`);
-  }
-}
-
 function usage(turn: ChatTurn) {
   return {
     prompt_tokens: turn.usage?.promptTokens ?? 0,
@@ -201,7 +184,6 @@ export async function respond(
   const created = Math.floor(Date.now() / 1000);
   if (!input.stream) {
     const turn = await runner(input, { signal });
-    validateChoice(input, turn);
     return Response.json({
       id,
       object: "chat.completion",
@@ -241,7 +223,6 @@ export async function respond(
       send({ role: "assistant" } as ChatDelta, null);
       void runner(input, { signal, onDelta: (delta) => send(delta, null) })
         .then((turn) => {
-          validateChoice(input, turn);
           send({}, turn.finishReason, turn);
         })
         .catch((error) =>
