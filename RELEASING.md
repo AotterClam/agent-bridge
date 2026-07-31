@@ -19,6 +19,7 @@ never store it in the repository or shell profile.
    bun install --frozen-lockfile
    bun run check
    bun test
+   npm run test:node
    npm pack --dry-run --registry https://registry.npmjs.org
    ```
 

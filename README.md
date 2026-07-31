@@ -16,11 +16,17 @@ SDK.
 
 ## Requirements
 
-- Bun 1.3 or newer
+- Node.js 22 or newer, or Bun 1.3 or newer
 - Claude Code installed and signed in for the Claude adapter
 - Codex CLI installed and signed in for the Codex adapter
 
 ## Install
+
+```sh
+npm install @aotterclam/agent-bridge
+```
+
+Or with Bun:
 
 ```sh
 bun add @aotterclam/agent-bridge
@@ -29,6 +35,13 @@ bun add @aotterclam/agent-bridge
 ## Run
 
 Start the standalone loopback service with a random control token:
+
+```sh
+export AGENT_BRIDGE_CONTROL_TOKEN="$(openssl rand -hex 32)"
+npx @aotterclam/agent-bridge
+```
+
+With Bun:
 
 ```sh
 export AGENT_BRIDGE_CONTROL_TOKEN="$(openssl rand -hex 32)"
@@ -100,7 +113,7 @@ repeated runs, so silence is treated as unsupported rather than assumed to work.
 
 ## Embed
 
-A Bun application can own the server directly:
+A Node.js or Bun application can own the server directly:
 
 ```ts
 import {
@@ -145,6 +158,7 @@ OpenAI.
 bun install
 bun run check
 bun test
+npm run test:node
 ```
 
 ## License
