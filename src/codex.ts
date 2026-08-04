@@ -139,6 +139,9 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
     notify(method: string, params?: unknown) {
       child.stdin.write(`${JSON.stringify({ method, ...(params === undefined ? {} : { params }) })}\n`);
     },
+    respond(id: number | string, result: unknown) {
+      child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    },
     close(error = new Error("Codex app-server closed")) {
       lines.close();
       pending.forEach(({ reject }) => reject(error));
@@ -206,138 +209,96 @@ export async function detectCodex() {
   }
 }
 
-export const runCodex: ChatRunner = async (input, options = {}) => {
-  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
-  const child = spawn(
-    command(),
-    [
-      "--disable", "shell_tool",
-      "--disable", "unified_exec",
-      "--disable", "apps",
-      "--disable", "browser_use",
-      "--disable", "computer_use",
-      "--disable", "image_generation",
-      "--disable", "multi_agent",
-      "app-server",
-      "--stdio"
-    ],
-    { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
-  );
-  let content = "";
-  let stderr = "";
-  let usage: ChatTurn["usage"];
-  let settled = false;
-  const toolCalls: ChatTurn["toolCalls"] = [];
-  let resolve!: (turn: ChatTurn) => void;
-  let reject!: (error: Error) => void;
-  const result = new Promise<ChatTurn>((ok, fail) => {
-    resolve = ok;
-    reject = fail;
-  });
-  const fail = (error: Error) => {
-    if (!settled) {
-      settled = true;
-      reject(error);
-    }
-  };
-  const client = rpc(child, (message) => {
-    const params = message.params ?? {};
-    if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
-      content += params.delta;
-    } else if (
-      (message.method === "item/reasoning/summaryTextDelta" ||
-        message.method === "item/reasoning/textDelta") &&
-      typeof params.delta === "string"
-    ) {
-      options.onDelta?.({ reasoning_content: params.delta });
-    } else if (message.method === "thread/tokenUsage/updated") {
-      usage = tokenUsage(params) ?? usage;
-    } else if (message.method === "item/tool/call") {
-      const call = {
-        id: String(params.callId ?? crypto.randomUUID()),
-        name: String(params.tool ?? ""),
-        arguments: record(params.arguments)
-      };
-      toolCalls.push(call);
-      if (content) options.onDelta?.({ content });
-      options.onDelta?.({
-        tool_calls: [{
-          index: toolCalls.length - 1,
-          id: call.id,
-          type: "function",
-          function: { name: call.name, arguments: JSON.stringify(call.arguments) }
-        }]
-      });
-      if (!settled) {
-        settled = true;
-        resolve({ content: content || null, toolCalls, finishReason: "tool_calls", usage });
-      }
-    } else if (message.method === "turn/completed" && !settled) {
-      const turn = record(params.turn);
-      if (turn.status !== "completed") {
-        fail(new Error(String(record(turn.error).message ?? "Codex turn failed")));
-      } else {
-        try {
-          const completed = completedCodexTurn(
-            content,
-            toolCalls,
-            usage,
-            selectedTools(input)
-          );
-          if (!toolCalls.length && completed.toolCalls.length) {
-            const call = completed.toolCalls[0]!;
-            options.onDelta?.({
-              tool_calls: [{
-                index: 0,
-                id: call.id,
-                type: "function",
-                function: {
-                  name: call.name,
-                  arguments: JSON.stringify(call.arguments)
-                }
-              }]
-            });
-          } else if (completed.content) {
-            options.onDelta?.({ content: completed.content });
-          }
-          settled = true;
-          resolve(completed);
-        } catch (error) {
-          fail(error instanceof Error ? error : new Error("Codex turn failed"));
-        }
-      }
-    } else if (message.method?.includes("requestApproval")) {
-      fail(new Error(`Codex built-in operation refused: ${message.method}`));
-    }
-  });
-  const abort = () => {
-    fail(new Error("Codex bridge aborted"));
-    child.kill("SIGTERM");
-  };
-  if (options.signal?.aborted) abort();
-  else options.signal?.addEventListener("abort", abort, { once: true });
-  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-  child.on("error", fail);
-  child.on("close", (code) => {
-    client.close();
-    fail(new Error(`Codex exited ${code ?? "without a code"}: ${stderr.slice(-1000)}`));
-  });
-  const timeoutMs = codexTurnTimeoutMs();
-  const timeout = setTimeout(
-    () => fail(new Error(`Codex turn timed out after ${timeoutMs} ms.`)),
-    timeoutMs
-  );
-  timeout.unref();
+type RunOptions = NonNullable<Parameters<ChatRunner>[1]>;
+type ToolMessage = Extract<ChatRequest["messages"][number], { role: "tool" }>;
 
-  try {
-    await client.request("initialize", {
+const pendingCalls = new Map<string, CodexSession>();
+const sessions = new Set<CodexSession>();
+
+function toolText(message: ToolMessage) {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.map((part) => part.text).join("");
+}
+
+function pendingResult(input: ChatRequest) {
+  for (let index = input.messages.length - 1; index >= 0; index--) {
+    const message = input.messages[index];
+    if (message?.role !== "tool") continue;
+    const session = pendingCalls.get(message.tool_call_id);
+    if (session) return { session, message };
+  }
+}
+
+class CodexSession {
+  private readonly client: ReturnType<typeof rpc>;
+  private threadId?: string;
+  private content = "";
+  private stderr = "";
+  private usage?: ChatTurn["usage"];
+  private pending?: { callId: string; requestId: number | string };
+  private waiter?: {
+    input: ChatRequest;
+    options: RunOptions;
+    resolve: (turn: ChatTurn) => void;
+    reject: (error: Error) => void;
+    abort: () => void;
+  };
+  private timeout?: NodeJS.Timeout;
+  private cleanup?: Promise<void>;
+
+  private constructor(
+    private readonly cwd: string,
+    private readonly child: ChildProcessWithoutNullStreams
+  ) {
+    this.client = rpc(child, (message) => this.onMessage(message));
+    child.stderr.on("data", (chunk) => { this.stderr += chunk.toString(); });
+    child.on("error", (error) => { void this.close(error); });
+    child.on("close", (code) => {
+      void this.close(
+        new Error(`Codex exited ${code ?? "without a code"}: ${this.stderr.slice(-1000)}`)
+      );
+    });
+  }
+
+  static async create(input: ChatRequest) {
+    const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
+    const child = spawn(
+      command(),
+      [
+        "--disable", "shell_tool",
+        "--disable", "unified_exec",
+        "--disable", "apps",
+        "--disable", "browser_use",
+        "--disable", "computer_use",
+        "--disable", "image_generation",
+        "--disable", "multi_agent",
+        "app-server",
+        "--stdio"
+      ],
+      { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const session = new CodexSession(cwd, child);
+    sessions.add(session);
+    try {
+      await session.initialize(input);
+      return session;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error("Codex initialization failed");
+      await session.close(failure);
+      throw failure;
+    }
+  }
+
+  private async initialize(input: ChatRequest) {
+    await this.client.request("initialize", {
       clientInfo: { name: "agent-bridge", title: "Agent Bridge", version: "0.1.0" },
       capabilities: { experimentalApi: true, requestAttestation: false }
     });
-    client.notify("initialized");
-    const started = record(await client.request("thread/start", {
+    this.client.notify("initialized");
+    const started = record(await this.client.request("thread/start", {
       model: input.model,
-      cwd,
+      cwd: this.cwd,
       approvalPolicy: "never",
       sandbox: "read-only",
       ephemeral: true,
@@ -352,19 +313,180 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
     }));
     const threadId = record(started.thread).id;
     if (typeof threadId !== "string") throw new Error("Codex returned no thread id");
-    await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: promptFor(input.messages, input.tool_choice), text_elements: [] }],
-      ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}),
-      summary: "concise"
-    });
-    return await result;
-  } finally {
-    settled = true;
-    clearTimeout(timeout);
-    options.signal?.removeEventListener("abort", abort);
-    child.kill("SIGTERM");
-    client.close();
-    await rm(cwd, { recursive: true, force: true });
+    this.threadId = threadId;
   }
+
+  async start(input: ChatRequest, options: RunOptions) {
+    const result = this.wait(input, options);
+    try {
+      await this.client.request("turn/start", {
+        threadId: this.threadId,
+        input: [{ type: "text", text: promptFor(input.messages, input.tool_choice), text_elements: [] }],
+        ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}),
+        summary: "concise"
+      });
+    } catch (error) {
+      void this.close(error instanceof Error ? error : new Error("Codex turn failed"));
+    }
+    return result;
+  }
+
+  resume(input: ChatRequest, message: ToolMessage, options: RunOptions) {
+    if (!this.pending || this.pending.callId !== message.tool_call_id) {
+      return Promise.reject(new Error("Codex tool call is no longer pending"));
+    }
+    const { callId, requestId } = this.pending;
+    this.pending = undefined;
+    pendingCalls.delete(callId);
+    const result = this.wait(input, options);
+    this.client.respond(requestId, {
+      contentItems: [{ type: "inputText", text: toolText(message) }],
+      success: true
+    });
+    return result;
+  }
+
+  private wait(input: ChatRequest, options: RunOptions) {
+    if (this.cleanup) return Promise.reject(new Error("Codex session is closed"));
+    if (this.waiter) return Promise.reject(new Error("Codex session is already running"));
+    this.clearTimeout();
+    this.content = "";
+    const result = new Promise<ChatTurn>((resolve, reject) => {
+      const abort = () => { void this.close(new Error("Codex bridge aborted")); };
+      this.waiter = { input, options, resolve, reject, abort };
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+    });
+    if (!this.cleanup) this.armTimeout("Codex turn");
+    return result;
+  }
+
+  private onMessage(message: RpcMessage) {
+    const params = message.params ?? {};
+    if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
+      this.content += params.delta;
+    } else if (
+      (message.method === "item/reasoning/summaryTextDelta" ||
+        message.method === "item/reasoning/textDelta") &&
+      typeof params.delta === "string"
+    ) {
+      this.waiter?.options.onDelta?.({ reasoning_content: params.delta });
+    } else if (message.method === "thread/tokenUsage/updated") {
+      this.usage = tokenUsage(params) ?? this.usage;
+    } else if (message.method === "item/tool/call") {
+      if (message.id == null || this.pending) {
+        void this.close(new Error("Codex emitted overlapping tool calls"));
+        return;
+      }
+      const call = {
+        id: String(params.callId ?? crypto.randomUUID()),
+        name: String(params.tool ?? ""),
+        arguments: record(params.arguments)
+      };
+      this.pending = { callId: call.id, requestId: message.id };
+      pendingCalls.set(call.id, this);
+      if (this.content) this.waiter?.options.onDelta?.({ content: this.content });
+      this.emitCall(call);
+      this.resolve({
+        content: this.content || null,
+        toolCalls: [call],
+        finishReason: "tool_calls",
+        usage: this.usage
+      });
+      // ponytail: one in-flight dynamic call per Codex turn; batch only if a model emits parallel calls.
+      this.armTimeout("Codex tool result");
+    } else if (message.method === "turn/completed") {
+      const turn = record(params.turn);
+      if (turn.status !== "completed") {
+        void this.close(new Error(String(record(turn.error).message ?? "Codex turn failed")));
+        return;
+      }
+      try {
+        const completed = completedCodexTurn(
+          this.content,
+          [],
+          this.usage,
+          this.waiter ? selectedTools(this.waiter.input) : []
+        );
+        if (completed.toolCalls.length) {
+          this.emitCall(completed.toolCalls[0]!);
+        } else if (completed.content) {
+          this.waiter?.options.onDelta?.({ content: completed.content });
+        }
+        this.resolve(completed);
+        void this.close();
+      } catch (error) {
+        void this.close(error instanceof Error ? error : new Error("Codex turn failed"));
+      }
+    } else if (message.method?.includes("requestApproval")) {
+      void this.close(new Error(`Codex built-in operation refused: ${message.method}`));
+    }
+  }
+
+  private resolve(turn: ChatTurn) {
+    const waiter = this.takeWaiter();
+    waiter?.resolve(turn);
+  }
+
+  private emitCall(call: ChatTurn["toolCalls"][number]) {
+    this.waiter?.options.onDelta?.({
+      tool_calls: [{
+        index: 0,
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+      }]
+    });
+  }
+
+  private takeWaiter() {
+    const waiter = this.waiter;
+    this.waiter = undefined;
+    this.clearTimeout();
+    if (waiter) waiter.options.signal?.removeEventListener("abort", waiter.abort);
+    return waiter;
+  }
+
+  private armTimeout(label: string) {
+    this.clearTimeout();
+    const timeoutMs = codexTurnTimeoutMs();
+    this.timeout = setTimeout(
+      () => { void this.close(new Error(`${label} timed out after ${timeoutMs} ms.`)); },
+      timeoutMs
+    );
+    this.timeout.unref();
+  }
+
+  private clearTimeout() {
+    if (this.timeout) clearTimeout(this.timeout);
+    this.timeout = undefined;
+  }
+
+  close(error = new Error("Codex session closed")) {
+    if (this.cleanup) return this.cleanup;
+    this.clearTimeout();
+    const waiter = this.takeWaiter();
+    waiter?.reject(error);
+    if (this.pending) pendingCalls.delete(this.pending.callId);
+    this.pending = undefined;
+    sessions.delete(this);
+    this.client.close(error);
+    if (!this.child.killed) this.child.kill("SIGTERM");
+    this.cleanup = rm(this.cwd, { recursive: true, force: true });
+    return this.cleanup;
+  }
+}
+
+export async function closeCodexSessions() {
+  await Promise.all([...sessions].map((session) => session.close()));
+}
+
+export const runCodex: ChatRunner = async (input, options = {}) => {
+  const pending = pendingResult(input);
+  if (pending && selectedTools(input).length) {
+    return pending.session.resume(input, pending.message, options);
+  }
+  if (pending) await pending.session.close();
+  const session = await CodexSession.create(input);
+  return session.start(input, options);
 };
