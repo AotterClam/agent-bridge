@@ -13,6 +13,7 @@ import {
 
 const exec = promisify(execFile);
 const REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
+const DEFAULT_CODEX_TURN_TIMEOUT_MS = 300_000;
 
 type RpcMessage = {
   id?: number | string;
@@ -30,6 +31,33 @@ function record(value: unknown): Record<string, unknown> {
 
 function command() {
   return process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex";
+}
+
+export function codexTurnTimeoutMs(
+  value = process.env.AGENT_BRIDGE_CODEX_TIMEOUT_MS
+) {
+  if (value === undefined) return DEFAULT_CODEX_TURN_TIMEOUT_MS;
+  const timeout = Number(value);
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new Error("AGENT_BRIDGE_CODEX_TIMEOUT_MS must be a positive integer");
+  }
+  return timeout;
+}
+
+export function completedCodexTurn(
+  content: string,
+  toolCalls: ChatTurn["toolCalls"],
+  usage?: ChatTurn["usage"]
+): ChatTurn {
+  if (!content && !toolCalls.length) {
+    throw new Error("Codex bridge returned no assistant turn");
+  }
+  return {
+    content: content || null,
+    toolCalls,
+    finishReason: toolCalls.length ? "tool_calls" : "stop",
+    usage
+  };
 }
 
 export function codexEnvironment(home: string) {
@@ -215,13 +243,13 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
       if (turn.status !== "completed") {
         fail(new Error(String(record(turn.error).message ?? "Codex turn failed")));
       } else {
-        settled = true;
-        resolve({
-          content: content || null,
-          toolCalls,
-          finishReason: toolCalls.length ? "tool_calls" : "stop",
-          usage
-        });
+        try {
+          const completed = completedCodexTurn(content, toolCalls, usage);
+          settled = true;
+          resolve(completed);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error("Codex turn failed"));
+        }
       }
     } else if (message.method?.includes("requestApproval")) {
       fail(new Error(`Codex built-in operation refused: ${message.method}`));
@@ -239,7 +267,11 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
     client.close();
     fail(new Error(`Codex exited ${code ?? "without a code"}: ${stderr.slice(-1000)}`));
   });
-  const timeout = setTimeout(() => fail(new Error("Codex bridge timed out")), 120_000);
+  const timeoutMs = codexTurnTimeoutMs();
+  const timeout = setTimeout(
+    () => fail(new Error(`Codex turn timed out after ${timeoutMs} ms.`)),
+    timeoutMs
+  );
   timeout.unref();
 
   try {

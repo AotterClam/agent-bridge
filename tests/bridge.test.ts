@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { codexEnvironment } from "../src/codex.js";
+import {
+  codexEnvironment,
+  codexTurnTimeoutMs,
+  completedCodexTurn
+} from "../src/codex.js";
 import {
   chatRequestSchema,
   respond,
@@ -24,6 +28,21 @@ test("uses the configured Codex home while isolating the turn", () => {
     if (original == null) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = original;
   }
+});
+
+test("validates Codex turn completion and timeout configuration", () => {
+  expect(completedCodexTurn("done", [])).toMatchObject({
+    content: "done",
+    finishReason: "stop"
+  });
+  expect(() => completedCodexTurn("", [])).toThrow(
+    "Codex bridge returned no assistant turn"
+  );
+  expect(codexTurnTimeoutMs(undefined)).toBe(300_000);
+  expect(codexTurnTimeoutMs("450000")).toBe(450_000);
+  expect(() => codexTurnTimeoutMs("0")).toThrow(
+    "AGENT_BRIDGE_CODEX_TIMEOUT_MS must be a positive integer"
+  );
 });
 
 const namedChoice = chatRequestSchema.parse({
