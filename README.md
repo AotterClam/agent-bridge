@@ -136,6 +136,7 @@ process.once("exit", () => void bridge.close());
 | `AGENT_BRIDGE_PORT` | `3457` | Loopback listener port |
 | `AGENT_BRIDGE_CONTROL_TOKEN` | `local-development-only` | Capability discovery token |
 | `AGENT_BRIDGE_CLAUDE_TIMEOUT_MS` | `300000` | Maximum duration of one Claude SDK turn |
+| `AGENT_BRIDGE_CODEX_TIMEOUT_MS` | `300000` | Maximum duration of one Codex App Server turn |
 | `AGENT_BRIDGE_CODEX_COMMAND` | `codex` | Codex executable path |
 
 Generate a random control token for every host session. Keep capability tokens
