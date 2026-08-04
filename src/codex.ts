@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import {
   promptFor,
   selectedTools,
+  type ChatRequest,
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
@@ -47,16 +48,49 @@ export function codexTurnTimeoutMs(
 export function completedCodexTurn(
   content: string,
   toolCalls: ChatTurn["toolCalls"],
-  usage?: ChatTurn["usage"]
+  usage?: ChatTurn["usage"],
+  tools: ChatRequest["tools"] = []
 ): ChatTurn {
-  if (!content && !toolCalls.length) {
+  const recovered = !toolCalls.length
+    ? recoverTextToolCall(content, tools)
+    : undefined;
+  const calls = recovered ? [recovered] : toolCalls;
+  if (!content && !calls.length) {
     throw new Error("Codex bridge returned no assistant turn");
   }
   return {
-    content: content || null,
-    toolCalls,
-    finishReason: toolCalls.length ? "tool_calls" : "stop",
+    content: recovered ? null : content || null,
+    toolCalls: calls,
+    finishReason: calls.length ? "tool_calls" : "stop",
     usage
+  };
+}
+
+export function recoverTextToolCall(
+  content: string,
+  tools: ChatRequest["tools"]
+): ChatTurn["toolCalls"][number] | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(content.trim());
+  } catch {
+    return;
+  }
+  const call = record(value);
+  if (!tools.some(({ function: tool }) => tool.name === call.name)) return;
+  let args = call.arguments;
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      return;
+    }
+  }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return;
+  return {
+    id: `exec-${crypto.randomUUID()}`,
+    name: String(call.name),
+    arguments: args as Record<string, unknown>
   };
 }
 
@@ -210,7 +244,6 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
     const params = message.params ?? {};
     if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
       content += params.delta;
-      options.onDelta?.({ content: params.delta });
     } else if (
       (message.method === "item/reasoning/summaryTextDelta" ||
         message.method === "item/reasoning/textDelta") &&
@@ -226,6 +259,7 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
         arguments: record(params.arguments)
       };
       toolCalls.push(call);
+      if (content) options.onDelta?.({ content });
       options.onDelta?.({
         tool_calls: [{
           index: toolCalls.length - 1,
@@ -244,7 +278,28 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
         fail(new Error(String(record(turn.error).message ?? "Codex turn failed")));
       } else {
         try {
-          const completed = completedCodexTurn(content, toolCalls, usage);
+          const completed = completedCodexTurn(
+            content,
+            toolCalls,
+            usage,
+            selectedTools(input)
+          );
+          if (!toolCalls.length && completed.toolCalls.length) {
+            const call = completed.toolCalls[0]!;
+            options.onDelta?.({
+              tool_calls: [{
+                index: 0,
+                id: call.id,
+                type: "function",
+                function: {
+                  name: call.name,
+                  arguments: JSON.stringify(call.arguments)
+                }
+              }]
+            });
+          } else if (completed.content) {
+            options.onDelta?.({ content: completed.content });
+          }
           settled = true;
           resolve(completed);
         } catch (error) {
