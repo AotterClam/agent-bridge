@@ -8,7 +8,7 @@ import {
   createClaudeHandler,
   discoverClaudeModels
 } from "./claude-bridge.mjs";
-import { detectCodex, runCodex } from "./codex.js";
+import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
 import { chatRequestSchema, respond } from "./protocol.js";
 
 export type AdapterId = "claude" | "codex";
@@ -207,9 +207,10 @@ export function createAgentBridge(
         apiKey: tokens[adapter]
       };
     },
-    close() {
+    async close() {
       claude.close();
-      return new Promise<void>((resolve, reject) =>
+      await closeCodexSessions();
+      await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
       );
     }
