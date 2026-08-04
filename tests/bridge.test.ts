@@ -4,7 +4,8 @@ import { join } from "node:path";
 import {
   codexEnvironment,
   codexTurnTimeoutMs,
-  completedCodexTurn
+  completedCodexTurn,
+  recoverTextToolCall
 } from "../src/codex.js";
 import {
   chatRequestSchema,
@@ -43,6 +44,31 @@ test("validates Codex turn completion and timeout configuration", () => {
   expect(() => codexTurnTimeoutMs("0")).toThrow(
     "AGENT_BRIDGE_CODEX_TIMEOUT_MS must be a positive integer"
   );
+});
+
+test("recovers a registered tool call emitted as the whole assistant text", () => {
+  const tools = [{
+    type: "function" as const,
+    function: { name: "inspect_catalog", parameters: { type: "object" } }
+  }];
+  const content = JSON.stringify({
+    name: "inspect_catalog",
+    arguments: JSON.stringify({ dataset: "dim_partner" })
+  });
+
+  expect(recoverTextToolCall(content, tools)).toMatchObject({
+    name: "inspect_catalog",
+    arguments: { dataset: "dim_partner" }
+  });
+  expect(completedCodexTurn(content, [], undefined, tools)).toMatchObject({
+    content: null,
+    finishReason: "tool_calls",
+    toolCalls: [{ name: "inspect_catalog" }]
+  });
+  expect(recoverTextToolCall(
+    '{"name":"revenue","arguments":{"unit":"TWD"}}',
+    tools
+  )).toBeUndefined();
 });
 
 const namedChoice = chatRequestSchema.parse({
