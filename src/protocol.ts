@@ -54,9 +54,7 @@ export const chatRequestSchema = z
       .default([]),
     tool_choice: toolChoice.optional().default("auto"),
     stream: z.boolean().optional().default(false),
-    reasoning_effort: z
-      .enum(["low", "medium", "high", "xhigh", "max"])
-      .optional()
+    reasoning_effort: z.string().min(1).optional()
   })
   .passthrough();
 
