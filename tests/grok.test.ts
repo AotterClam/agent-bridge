@@ -61,9 +61,47 @@ if (process.argv.includes("models")) {
   process.exit(0);
 }
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
-createInterface({ input: process.stdin }).on("line", (line) => {
+let mcpUrl;
+let toolPrompt;
+async function runLookup(message) {
+  const callTool = (id, name, args) => fetch(mcpUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: {
+      name, arguments: args
+    } })
+  });
+  const first = callTool(99, "lookup", { key: "alpha" });
+  const second = callTool(100, "lookup_two", { key: "beta" });
+  const call = { jsonrpc: "2.0", method: "session/update", params: { update: {
+    sessionUpdate: "tool_call",
+    toolCallId: "call-1",
+    title: "use_tool",
+    rawInput: { tool_name: "lookup", tool_input: { key: "alpha" } }
+  } } };
+  send(call);
+  send(call);
+  send({ jsonrpc: "2.0", method: "session/update", params: { update: {
+    sessionUpdate: "tool_call",
+    toolCallId: "call-2",
+    title: "use_tool",
+    rawInput: { tool_name: "lookup_two", tool_input: { key: "beta" } }
+  } } });
+  const payloads = await Promise.all([first, second].map(async (result) =>
+    (await result).json()
+  ));
+  send({ jsonrpc: "2.0", method: "session/update", params: { update: {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: payloads.map((payload) => payload.result.content[0].text).join("") }
+  } } });
+  send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
+}
+createInterface({ input: process.stdin }).on("line", async (line) => {
   const message = JSON.parse(line);
-  if (message.method === "initialize") {
+  if (message.id === 77 && message.result) {
+    if (message.result.outcome.optionId !== "allow-once") process.exit(2);
+    await runLookup(toolPrompt);
+  } else if (message.method === "initialize") {
     send({ jsonrpc: "2.0", id: message.id, result: {
       authMethods: [{ id: "cached_token" }],
       _meta: { modelState: { availableModels: [{
@@ -75,16 +113,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else if (message.method === "authenticate") {
     send({ jsonrpc: "2.0", id: message.id, result: {} });
   } else if (message.method === "session/new") {
+    mcpUrl = message.params.mcpServers[0]?.url;
     send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "sess-1" } });
   } else if (message.method === "session/prompt") {
     const text = message.params.prompt[0].text;
     if (text.includes("lookup")) {
-      send({ jsonrpc: "2.0", method: "session/update", params: { update: {
-        sessionUpdate: "tool_call",
-        toolCallId: "call-1",
-        title: "openai__lookup",
-        rawInput: { tool_name: "openai__lookup", tool_input: { key: "alpha" } }
-      } } });
+      toolPrompt = message;
+      send({ jsonrpc: "2.0", id: 77, method: "session/request_permission", params: {
+        toolCall: { title: "use_tool", rawInput: { tool_name: "lookup" } },
+        options: [
+          { kind: "allow_once", optionId: "allow-once" },
+          { kind: "reject_once", optionId: "reject-once" }
+        ]
+      } });
       return;
     }
     send({ jsonrpc: "2.0", method: "session/update", params: { update: {
@@ -135,16 +176,44 @@ test("runs a Grok ACP text turn and returns a host tool call", async () => {
       { content: "PONG" }
     ]);
 
-    expect(await runGrok(chatRequestSchema.parse({
-      model: "grok-4.6",
-      messages: [{ role: "user", content: "Call lookup" }],
-      tools: [{
+    const messages = [{ role: "user" as const, content: "Call lookup" }];
+    const tools = [{
+      type: "function" as const,
+      function: { name: "lookup", parameters: { type: "object" } }
+    }, {
+      type: "function" as const,
+      function: { name: "lookup_two", parameters: { type: "object" } }
+    }];
+    const append = (turn: Awaited<ReturnType<typeof runGrok>>, content: string) => {
+      messages.push({ role: "assistant", content: "" } as never);
+      (messages.at(-1) as Record<string, unknown>).tool_calls = turn.toolCalls.map((call) => ({
+        id: call.id,
         type: "function",
-        function: { name: "lookup", parameters: { type: "object" } }
-      }]
-    }))).toMatchObject({
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+      }));
+      messages.push({ role: "tool", tool_call_id: turn.toolCalls[0]!.id, content } as never);
+    };
+    const toolTurn = await runGrok(chatRequestSchema.parse({
+      model: "grok-4.6",
+      messages,
+      tools
+    }));
+    expect(toolTurn).toMatchObject({
       finishReason: "tool_calls",
       toolCalls: [{ id: "call-1", name: "lookup", arguments: { key: "alpha" } }]
     });
+    append(toolTurn, "RESULT1");
+    const secondTurn = await runGrok(chatRequestSchema.parse({
+      model: "grok-4.6",
+      messages,
+      tools
+    }));
+    expect(secondTurn).toMatchObject({
+      finishReason: "tool_calls",
+      toolCalls: [{ id: "call-2", name: "lookup_two", arguments: { key: "beta" } }]
+    });
+    append(secondTurn, "RESULT2");
+    expect(await runGrok(chatRequestSchema.parse({ model: "grok-4.6", messages, tools })))
+      .toMatchObject({ content: "RESULT1RESULT2", finishReason: "stop" });
   });
 }, 10_000);

@@ -238,10 +238,10 @@ export async function listen(
   bridge = createAgentBridge({ preloadModels: true }),
   port = Number(process.env.AGENT_BRIDGE_PORT ?? 3457)
 ) {
-  await bridge.capabilities();
   await new Promise<void>((resolve, reject) => {
     bridge.server.once("error", reject);
     bridge.server.listen(port, "127.0.0.1", resolve);
   });
+  void bridge.capabilities();
   return bridge;
 }

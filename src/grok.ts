@@ -138,7 +138,8 @@ async function discoverGrokModelsViaAcp() {
         clientCapabilities: {}
       }),
       new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("Grok initialize timed out")), 15_000);
+        const timer = setTimeout(() => reject(new Error("Grok initialize timed out")), 15_000);
+        timer.unref();
       })
     ]);
     const models = modelsFromGrokInitialize(init);
@@ -146,7 +147,10 @@ async function discoverGrokModelsViaAcp() {
   } finally {
     client.close();
     if (!child.killed) child.kill("SIGTERM");
-    await rm(cwd, { recursive: true, force: true });
+    setTimeout(() => {
+      if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    }, 1_000).unref();
+    void rm(cwd, { recursive: true, force: true });
   }
 }
 
@@ -236,20 +240,48 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
   };
 }
 
-function hostToolCall(update: Record<string, unknown>) {
+function hostToolCall(update: Record<string, unknown>, allowed?: ReadonlySet<string>) {
   const raw = record(update.rawInput);
   const qualified = String(raw.tool_name ?? update.title ?? "");
-  if (!qualified.startsWith(HOST_PREFIX)) return;
+  const name = qualified.startsWith(HOST_PREFIX)
+    ? qualified.slice(HOST_PREFIX.length)
+    : qualified;
+  if (!qualified.startsWith(HOST_PREFIX) && !allowed?.has(name)) return;
   const args = raw.tool_input ?? raw.arguments ?? {};
   return {
     id: String(update.toolCallId ?? crypto.randomUUID()),
-    name: qualified.slice(HOST_PREFIX.length),
+    name,
     arguments: record(args)
   };
 }
 
+type ToolMessage = Extract<ChatRequest["messages"][number], { role: "tool" }>;
+
+function toolText(message: ToolMessage) {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.map((part) => part.text).join("");
+}
+
 async function startHostTools(tools: ChatRequest["tools"]) {
   if (!tools.length) return;
+  const pending: Array<{
+    id: number | string | undefined;
+    response: import("node:http").ServerResponse;
+  }> = [];
+  const results: string[] = [];
+  // ponytail: Grok emits and dispatches parallel MCP calls in order; key by call signature if it stops doing so.
+  const respond = () => {
+    if (!pending.length || !results.length) return;
+    const { id, response } = pending.shift()!;
+    const content = results.shift()!;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      result: { content: [{ type: "text", text: content }] }
+    }));
+  };
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk) => {
@@ -296,8 +328,8 @@ async function startHostTools(tools: ChatRequest["tools"]) {
         return;
       }
       if (payload.method === "tools/call") {
-        // Leave the MCP call open so Grok cannot continue with a stub result.
-        request.once("close", () => {});
+        pending.push({ id: payload.id, response });
+        respond();
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
@@ -319,12 +351,19 @@ async function startHostTools(tools: ChatRequest["tools"]) {
   }
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
+    resume(content: string) {
+      results.push(content);
+      respond();
+    },
     close() {
+      pending.forEach(({ response }) => response.destroy());
+      pending.length = 0;
       return new Promise<void>((resolve) => server.close(() => resolve()));
     }
   };
 }
 
+const pendingCalls = new Map<string, GrokSession>();
 const sessions = new Set<GrokSession>();
 
 class GrokSession {
@@ -342,6 +381,9 @@ class GrokSession {
   private timeout?: NodeJS.Timeout;
   private cleanup?: Promise<void>;
   private resolved = false;
+  private hostToolNames = new Set<string>();
+  private pendingToolCalls: ChatTurn["toolCalls"] = [];
+  private seenToolCalls = new Set<string>();
 
   private constructor(
     private readonly cwd: string,
@@ -386,6 +428,7 @@ class GrokSession {
 
   private async initialize(input: ChatRequest) {
     const tools = selectedTools(input);
+    this.hostToolNames = new Set(tools.map(({ function: tool }) => tool.name));
     this.hostTools = await startHostTools(tools);
     const init = record(await this.client.request("initialize", {
       protocolVersion: 1,
@@ -463,6 +506,24 @@ class GrokSession {
     return result;
   }
 
+  resume(message: ToolMessage, options: RunOptions) {
+    const index = this.pendingToolCalls.findIndex((call) => call.id === message.tool_call_id);
+    if (index < 0) {
+      return Promise.reject(new Error("Grok tool call is no longer pending"));
+    }
+    this.pendingToolCalls.splice(index, 1);
+    pendingCalls.delete(message.tool_call_id);
+    const result = this.wait(options);
+    try {
+      this.hostTools?.resume(toolText(message));
+    } catch (error) {
+      void this.close(error instanceof Error ? error : new Error("Grok tool result failed"));
+    }
+    const next = this.pendingToolCalls[0];
+    if (next) this.resolveToolCall(next);
+    return result;
+  }
+
   private wait(options: RunOptions) {
     if (this.cleanup) return Promise.reject(new Error("Grok session is closed"));
     if (this.waiter) return Promise.reject(new Error("Grok session is already running"));
@@ -483,12 +544,15 @@ class GrokSession {
   private onMessage(message: RpcMessage) {
     if (message.method === "session/request_permission" && message.id != null) {
       const options = Array.isArray(message.params?.options) ? message.params.options : [];
-      const rejectId = options
+      const hostTool = hostToolCall(record(message.params?.toolCall), this.hostToolNames);
+      const optionId = options
         .map((value) => record(value))
-        .find((option) => String(option.kind ?? option.optionId).includes("reject"))
+        .find((option) => String(option.kind ?? option.optionId).includes(
+          hostTool ? "allow_once" : "reject"
+        ))
         ?.optionId;
       this.client.respond(message.id, {
-        outcome: { outcome: "selected", optionId: rejectId ?? "reject-once" }
+        outcome: { outcome: "selected", optionId: optionId ?? (hostTool ? "allow-once" : "reject-once") }
       });
       return;
     }
@@ -507,12 +571,19 @@ class GrokSession {
       return;
     }
     if (kind !== "tool_call") return;
-    const call = hostToolCall(update);
+    const call = hostToolCall(update, this.hostToolNames);
     if (!call) return;
+    if (this.seenToolCalls.has(call.id)) return;
+    this.seenToolCalls.add(call.id);
+    this.pendingToolCalls.push(call);
+    pendingCalls.set(call.id, this);
+    if (this.waiter) this.resolveToolCall(call);
+  }
+
+  private resolveToolCall(call: ChatTurn["toolCalls"][number]) {
     this.resolved = true;
-    this.client.notify("session/cancel", { sessionId: this.sessionId });
     this.emitCall(call);
-    this.resolve({
+    this.takeWaiter()?.resolve({
       content: this.content || null,
       toolCalls: [call],
       finishReason: "tool_calls"
@@ -564,6 +635,8 @@ class GrokSession {
     this.clearTimeout();
     const waiter = this.takeWaiter();
     if (!this.resolved) waiter?.reject(error);
+    this.pendingToolCalls.forEach((call) => pendingCalls.delete(call.id));
+    this.pendingToolCalls = [];
     sessions.delete(this);
     this.client.close(error);
     if (!this.child.killed) this.child.kill("SIGTERM");
@@ -580,6 +653,15 @@ export async function closeGrokSessions() {
 }
 
 export const runGrok: ChatRunner = async (input, options = {}) => {
+  for (let index = input.messages.length - 1; index >= 0; index--) {
+    const message = input.messages[index];
+    if (message?.role !== "tool") continue;
+    const pending = pendingCalls.get(message.tool_call_id);
+    if (!pending) continue;
+    if (selectedTools(input).length) return pending.resume(message, options);
+    await pending.close();
+    break;
+  }
   const session = await GrokSession.create(input);
   return session.prompt(input, options);
 };

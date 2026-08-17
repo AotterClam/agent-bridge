@@ -127,7 +127,7 @@ test("still rejects an unknown named tool before execution", () => {
   })).toThrow("Unknown tool_choice");
 });
 
-test("continues dynamic tool calls in the same Codex turn", async () => {
+test("replays Codex tool steps with the current tool list", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
   const fakeCodex = join(directory, "codex");
   const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
@@ -141,21 +141,22 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: message.id, result: { thread: { id: "thread-1" } } });
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1" } } });
-    if (message.params.input[0].text.includes("Do not call a function.")) {
+    const prompt = message.params.input[0].text;
+    if (prompt.includes("Do not call a function.")) {
       send({ method: "item/agentMessage/delta", params: { delta: "finalized" } });
       send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    } else if (prompt.includes("second result")) {
+      send({ method: "item/agentMessage/delta", params: { delta: "finished" } });
+      send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    } else if (prompt.includes("first result")) {
+      send({ id: 61, method: "item/tool/call", params: {
+        callId: "call-2", tool: "lookup_two", arguments: { key: "beta" }
+      } });
     } else {
       send({ id: 60, method: "item/tool/call", params: {
         callId: "call-1", tool: "lookup_one", arguments: { key: "alpha" }
       } });
     }
-  } else if (message.id === 60 && message.result?.contentItems?.[0]?.text === "first result") {
-    send({ id: 61, method: "item/tool/call", params: {
-      callId: "call-2", tool: "lookup_two", arguments: { key: "beta" }
-    } });
-  } else if (message.id === 61 && message.result?.contentItems?.[0]?.text === "second result") {
-    send({ method: "item/agentMessage/delta", params: { delta: "finished" } });
-    send({ method: "turn/completed", params: { turn: { status: "completed" } } });
   }
 });
 `);
@@ -171,11 +172,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   ];
 
   try {
-    const first = await runCodex(chatRequestSchema.parse({ model: "test", messages, tools }));
+    const first = await runCodex(chatRequestSchema.parse({
+      model: "test",
+      messages,
+      tools: [tools[0]]
+    }));
     expect(first.toolCalls).toMatchObject([{ id: "call-1", name: "lookup_one" }]);
     appendToolResult(messages, first, "first result");
 
-    const second = await runCodex(chatRequestSchema.parse({ model: "test", messages, tools }));
+    const second = await runCodex(chatRequestSchema.parse({
+      model: "test",
+      messages,
+      tools: [tools[1]]
+    }));
     expect(second.toolCalls).toMatchObject([{ id: "call-2", name: "lookup_two" }]);
     appendToolResult(messages, second, "second result");
 
