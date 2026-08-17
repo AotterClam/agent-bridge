@@ -9,9 +9,10 @@ import {
   discoverClaudeModels
 } from "./claude-bridge.mjs";
 import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
+import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
 import { chatRequestSchema, respond } from "./protocol.js";
 
-export type AdapterId = "claude" | "codex";
+export type AdapterId = "claude" | "codex" | "grok";
 export type AdapterCapability = {
   id: AdapterId;
   name: string;
@@ -114,16 +115,27 @@ export function createAgentBridge(
     "local-development-only";
   const tokens = {
     claude: capabilityToken(controlToken, "claude"),
-    codex: capabilityToken(controlToken, "codex")
+    codex: capabilityToken(controlToken, "codex"),
+    grok: capabilityToken(controlToken, "grok")
+  };
+  let adapters: AdapterCapability[] | undefined;
+  let loading: Promise<AdapterCapability[]> | undefined;
+  const capabilities = () => {
+    if (adapters) return Promise.resolve(adapters);
+    loading ??= Promise.all([detectClaude(), detectCodex(), detectGrok()]).then(
+      (value) => {
+        adapters = value;
+        return value;
+      }
+    );
+    return loading;
   };
   const claude = createClaudeHandler({
     token: tokens.claude,
-    preloadModels: options.preloadModels
+    listModels: async () =>
+      (await capabilities()).find((adapter) => adapter.id === "claude")?.models ?? []
   });
-  const capabilities = () =>
-    Promise.all([detectClaude(), detectCodex()]) as Promise<
-      AdapterCapability[]
-    >;
+  if (options.preloadModels) void capabilities();
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
@@ -151,16 +163,19 @@ export function createAgentBridge(
       return json(response, 401, { error: { message: "Invalid API key" } });
     }
     if (adapter === "claude") return claude(request, response);
+    const runtime = adapter === "grok"
+      ? { run: runGrok, ownedBy: "grok" }
+      : { run: runCodex, ownedBy: "codex" };
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
-      const status = await detectCodex();
-      return json(response, status.available ? 200 : 503, {
+      const status = (await capabilities()).find((item) => item.id === adapter);
+      return json(response, status?.available ? 200 : 503, {
         object: "list",
-        data: status.models.map((model) => ({
+        data: (status?.models ?? []).map((model) => ({
           ...model,
           object: "model",
           created: 0,
-          owned_by: "codex"
+          owned_by: runtime.ownedBy
         }))
       });
     }
@@ -184,7 +199,7 @@ export function createAgentBridge(
     });
     try {
       const input = chatRequestSchema.parse(await body(request));
-      await pipe(await respond(input, runCodex, controller.signal), response);
+      await pipe(await respond(input, runtime.run, controller.signal), response);
     } catch (error) {
       if (response.headersSent) return response.end();
       const status = Number(record(error).status ?? 500);
@@ -210,6 +225,8 @@ export function createAgentBridge(
     async close() {
       claude.close();
       await closeCodexSessions();
+      await closeGrokSessions();
+      if (!server.listening) return;
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
       );
@@ -225,5 +242,6 @@ export async function listen(
     bridge.server.once("error", reject);
     bridge.server.listen(port, "127.0.0.1", resolve);
   });
+  void bridge.capabilities();
   return bridge;
 }

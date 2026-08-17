@@ -139,9 +139,6 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
     notify(method: string, params?: unknown) {
       child.stdin.write(`${JSON.stringify({ method, ...(params === undefined ? {} : { params }) })}\n`);
     },
-    respond(id: number | string, result: unknown) {
-      child.stdin.write(`${JSON.stringify({ id, result })}\n`);
-    },
     close(error = new Error("Codex app-server closed")) {
       lines.close();
       pending.forEach(({ reject }) => reject(error));
@@ -210,23 +207,16 @@ export async function detectCodex() {
 }
 
 type RunOptions = NonNullable<Parameters<ChatRunner>[1]>;
-type ToolMessage = Extract<ChatRequest["messages"][number], { role: "tool" }>;
 
 const pendingCalls = new Map<string, CodexSession>();
 const sessions = new Set<CodexSession>();
-
-function toolText(message: ToolMessage) {
-  return typeof message.content === "string"
-    ? message.content
-    : message.content.map((part) => part.text).join("");
-}
 
 function pendingResult(input: ChatRequest) {
   for (let index = input.messages.length - 1; index >= 0; index--) {
     const message = input.messages[index];
     if (message?.role !== "tool") continue;
     const session = pendingCalls.get(message.tool_call_id);
-    if (session) return { session, message };
+    if (session) return session;
   }
 }
 
@@ -236,7 +226,7 @@ class CodexSession {
   private content = "";
   private stderr = "";
   private usage?: ChatTurn["usage"];
-  private pending?: { callId: string; requestId: number | string };
+  private pending?: { callId: string };
   private waiter?: {
     input: ChatRequest;
     options: RunOptions;
@@ -331,21 +321,6 @@ class CodexSession {
     return result;
   }
 
-  resume(input: ChatRequest, message: ToolMessage, options: RunOptions) {
-    if (!this.pending || this.pending.callId !== message.tool_call_id) {
-      return Promise.reject(new Error("Codex tool call is no longer pending"));
-    }
-    const { callId, requestId } = this.pending;
-    this.pending = undefined;
-    pendingCalls.delete(callId);
-    const result = this.wait(input, options);
-    this.client.respond(requestId, {
-      contentItems: [{ type: "inputText", text: toolText(message) }],
-      success: true
-    });
-    return result;
-  }
-
   private wait(input: ChatRequest, options: RunOptions) {
     if (this.cleanup) return Promise.reject(new Error("Codex session is closed"));
     if (this.waiter) return Promise.reject(new Error("Codex session is already running"));
@@ -374,7 +349,7 @@ class CodexSession {
     } else if (message.method === "thread/tokenUsage/updated") {
       this.usage = tokenUsage(params) ?? this.usage;
     } else if (message.method === "item/tool/call") {
-      if (message.id == null || this.pending) {
+      if (this.pending) {
         void this.close(new Error("Codex emitted overlapping tool calls"));
         return;
       }
@@ -383,7 +358,7 @@ class CodexSession {
         name: String(params.tool ?? ""),
         arguments: record(params.arguments)
       };
-      this.pending = { callId: call.id, requestId: message.id };
+      this.pending = { callId: call.id };
       pendingCalls.set(call.id, this);
       if (this.content) this.waiter?.options.onDelta?.({ content: this.content });
       this.emitCall(call);
@@ -483,10 +458,7 @@ export async function closeCodexSessions() {
 
 export const runCodex: ChatRunner = async (input, options = {}) => {
   const pending = pendingResult(input);
-  if (pending && selectedTools(input).length) {
-    return pending.session.resume(input, pending.message, options);
-  }
-  if (pending) await pending.session.close();
+  if (pending) await pending.close();
   const session = await CodexSession.create(input);
   return session.start(input, options);
 };
