@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -11,6 +11,7 @@ import {
 import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
 import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
 import { chatRequestSchema, respond } from "./protocol.js";
+import { z } from "zod";
 
 export type AdapterId = "claude" | "codex" | "grok";
 export type AdapterCapability = {
@@ -26,6 +27,26 @@ export type AdapterCapability = {
     defaultReasoningEffort?: string;
   }>;
 };
+export type AgentBridgeAdapter = AdapterCapability & {
+  capabilityToken: string;
+};
+
+const capabilitiesResponseSchema = z.object({
+  adapters: z.array(z.object({
+    id: z.enum(["claude", "codex", "grok"]),
+    name: z.string(),
+    available: z.boolean(),
+    version: z.string().nullable(),
+    error: z.string().nullable(),
+    capabilityToken: z.string().min(1),
+    models: z.array(z.object({
+      id: z.string(),
+      name: z.string(),
+      reasoningEfforts: z.array(z.string()),
+      defaultReasoningEffort: z.string().optional()
+    }))
+  }))
+});
 
 const MAX_BODY = 2 * 1024 * 1024;
 
@@ -118,17 +139,14 @@ export function createAgentBridge(
     codex: capabilityToken(controlToken, "codex"),
     grok: capabilityToken(controlToken, "grok")
   };
-  let adapters: AdapterCapability[] | undefined;
-  let loading: Promise<AdapterCapability[]> | undefined;
-  const capabilities = () => {
-    if (adapters) return Promise.resolve(adapters);
-    loading ??= Promise.all([detectClaude(), detectCodex(), detectGrok()]).then(
-      (value) => {
-        adapters = value;
-        return value;
-      }
-    );
-    return loading;
+  let capabilitiesPromise: Promise<AdapterCapability[]> | undefined;
+  const capabilities = (refresh = false) => {
+    if (refresh) capabilitiesPromise = undefined;
+    return capabilitiesPromise ??= Promise.all([
+      detectClaude(),
+      detectCodex(),
+      detectGrok()
+    ]);
   };
   const claude = createClaudeHandler({
     token: tokens.claude,
@@ -148,7 +166,9 @@ export function createAgentBridge(
         });
       }
       return json(response, 200, {
-        adapters: (await capabilities()).map((adapter) => ({
+        adapters: (await capabilities(
+          url.searchParams.get("refresh") === "1"
+        )).map((adapter) => ({
           ...adapter,
           capabilityToken: tokens[adapter.id]
         }))
@@ -242,6 +262,85 @@ export async function listen(
     bridge.server.once("error", reject);
     bridge.server.listen(port, "127.0.0.1", resolve);
   });
-  void bridge.capabilities();
   return bridge;
+}
+
+function loopbackBaseUrl(value: string) {
+  const url = new URL(value);
+  if (
+    url.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("Agent Bridge URL must be a loopback HTTP URL.");
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
+export function createAgentBridgeClient(clientOptions: {
+  baseUrl: string;
+  controlToken: string;
+  fetch?: typeof fetch;
+}) {
+  const baseUrl = loopbackBaseUrl(clientOptions.baseUrl);
+  const fetcher = clientOptions.fetch ?? globalThis.fetch;
+  const adapters = async (options: { refresh?: boolean } = {}) => {
+    const response = await fetcher(
+      `${baseUrl}/capabilities${options.refresh ? "?refresh=1" : ""}`,
+      {
+        headers: {
+          authorization: `Bearer ${clientOptions.controlToken}`
+        },
+        signal: AbortSignal.timeout(20_000)
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`Agent Bridge returned ${response.status}`);
+    }
+    return capabilitiesResponseSchema.parse(await response.json()).adapters;
+  };
+  return {
+    adapters,
+    async connection(id: AdapterId) {
+      const adapter = (await adapters()).find((item) => item.id === id);
+      if (!adapter?.available) throw new Error(`${id} is unavailable.`);
+      return {
+        adapter,
+        baseUrl: `${baseUrl}/v1`,
+        apiKey: adapter.capabilityToken
+      };
+    }
+  };
+}
+
+export type AgentBridgeClient = ReturnType<typeof createAgentBridgeClient>;
+
+export async function startAgentBridge(options: {
+  port?: number;
+  controlToken?: string;
+  preloadModels?: boolean;
+} = {}) {
+  const controlToken =
+    options.controlToken ?? randomBytes(32).toString("base64url");
+  const bridge = await listen(
+    createAgentBridge({
+      controlToken,
+      preloadModels: options.preloadModels ?? true
+    }),
+    options.port ?? 0
+  );
+  const address = bridge.server.address();
+  if (!address || typeof address === "string") {
+    await bridge.close();
+    throw new Error("Agent Bridge returned no TCP address.");
+  }
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  return {
+    ...bridge,
+    baseUrl,
+    ...createAgentBridgeClient({ baseUrl, controlToken })
+  };
 }
