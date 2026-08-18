@@ -1,5 +1,7 @@
 # @aotterclam/agent-bridge
 
+[![npm version](https://img.shields.io/npm/v/%40aotterclam%2Fagent-bridge)](https://www.npmjs.com/package/@aotterclam/agent-bridge)
+
 A local OpenAI-compatible bridge for official coding-agent runtimes.
 
 It provides one loopback API for Claude Code, Codex, and Grok Build while
@@ -23,6 +25,9 @@ SDK.
 - Grok Build CLI installed and signed in for the Grok adapter
 
 ## Install
+
+Published on [npm](https://www.npmjs.com/package/@aotterclam/agent-bridge), not
+GitHub Packages.
 
 ```sh
 npm install @aotterclam/agent-bridge
@@ -63,8 +68,33 @@ curl \
 The response contains an opaque capability token for each available adapter.
 Use that token as the API key and keep the selected native model ID unchanged.
 
+## Select an agent
+
+The bridge does not have a separate switch endpoint. The adapter's capability
+token selects the runtime; the model ID selects one of that adapter's models.
+The base URL stays the same.
+
+| Agent | Adapter ID |
+| --- | --- |
+| Claude Code | `claude` |
+| Codex | `codex` |
+| Grok Build | `grok` |
+
 ```ts
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+
+const selectedAgent = "grok"; // Change to "claude" or "codex".
+const response = await fetch("http://127.0.0.1:3457/capabilities", {
+  headers: { authorization: `Bearer ${process.env.AGENT_BRIDGE_CONTROL_TOKEN}` },
+});
+if (!response.ok) throw new Error(`Capabilities returned ${response.status}`);
+
+const { adapters } = await response.json();
+const selectedAdapter = adapters.find(({ id }) => id === selectedAgent);
+const selectedModel = selectedAdapter?.models[0];
+if (!selectedAdapter?.available || !selectedModel) {
+  throw new Error(`${selectedAgent} is unavailable`);
+}
 
 const provider = createOpenAICompatible({
   name: "local-agent-bridge",
@@ -74,6 +104,10 @@ const provider = createOpenAICompatible({
 
 const model = provider.chatModel(selectedModel.id);
 ```
+
+To switch agents, select another adapter and use its capability token and model
+on the next client or request. The control token is only for `/capabilities`;
+do not use it for `/v1` requests.
 
 Available OpenAI-compatible endpoints:
 
