@@ -81,25 +81,21 @@ The base URL stays the same.
 | Grok Build | `grok` |
 
 ```ts
+import { createAgentBridgeClient } from "@aotterclam/agent-bridge";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
-const selectedAgent = "grok"; // Change to "claude" or "codex".
-const response = await fetch("http://127.0.0.1:3457/capabilities", {
-  headers: { authorization: `Bearer ${process.env.AGENT_BRIDGE_CONTROL_TOKEN}` },
+const bridge = createAgentBridgeClient({
+  baseUrl: "http://127.0.0.1:3457",
+  controlToken: process.env.AGENT_BRIDGE_CONTROL_TOKEN!,
 });
-if (!response.ok) throw new Error(`Capabilities returned ${response.status}`);
-
-const { adapters } = await response.json();
-const selectedAdapter = adapters.find(({ id }) => id === selectedAgent);
-const selectedModel = selectedAdapter?.models[0];
-if (!selectedAdapter?.available || !selectedModel) {
-  throw new Error(`${selectedAgent} is unavailable`);
-}
+const connection = await bridge.connection("grok"); // Or "claude" / "codex".
+const selectedModel = connection.adapter.models[0];
+if (!selectedModel) throw new Error("The selected agent returned no models.");
 
 const provider = createOpenAICompatible({
   name: "local-agent-bridge",
-  baseURL: "http://127.0.0.1:3457/v1",
-  apiKey: selectedAdapter.capabilityToken,
+  baseURL: connection.baseUrl,
+  apiKey: connection.apiKey,
 });
 
 const model = provider.chatModel(selectedModel.id);
@@ -149,29 +145,25 @@ repeated runs, so silence is treated as unsupported rather than assumed to work.
 
 ## Embed
 
-A Node.js or Bun application can own the server directly:
+A Node.js or Bun application can own the server directly. `startAgentBridge()`
+creates a random control token and asks the operating system for an unused
+loopback port:
 
 ```ts
-import {
-  createAgentBridge,
-  listen,
-} from "@aotterclam/agent-bridge";
+import { startAgentBridge } from "@aotterclam/agent-bridge";
 
-const bridge = await listen(
-  createAgentBridge({ controlToken: sessionControlToken }),
-  0,
-);
+const bridge = await startAgentBridge();
 
-const address = bridge.server.address();
-if (!address || typeof address === "string") throw new Error("No bridge port");
-console.log(`Agent Bridge: http://127.0.0.1:${address.port}/v1`);
+console.log(`Agent Bridge: ${bridge.baseUrl}/v1`);
+const codex = await bridge.connection("codex");
 
 process.once("exit", () => void bridge.close());
 ```
 
-Pass `0` to let the operating system select an unused port, or pass a specific
-port number when the host owns that port. Read the assigned port from
-`bridge.server.address()` after `listen()` resolves.
+Pass `{ port: 3457 }` only when the host owns a fixed port. Use
+`bridge.adapters({ refresh: true })` to recheck installed and signed-in clients.
+For lower-level server control, `createAgentBridge()` and `listen()` remain
+available.
 
 ## Configuration
 
