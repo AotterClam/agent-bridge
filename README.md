@@ -125,11 +125,19 @@ import {
 
 const bridge = await listen(
   createAgentBridge({ controlToken: sessionControlToken }),
-  3457,
+  0,
 );
+
+const address = bridge.server.address();
+if (!address || typeof address === "string") throw new Error("No bridge port");
+console.log(`Agent Bridge: http://127.0.0.1:${address.port}/v1`);
 
 process.once("exit", () => void bridge.close());
 ```
+
+Pass `0` to let the operating system select an unused port, or pass a specific
+port number when the host owns that port. Read the assigned port from
+`bridge.server.address()` after `listen()` resolves.
 
 ## Configuration
 
