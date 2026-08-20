@@ -10,10 +10,15 @@ import {
 } from "./claude-bridge.mjs";
 import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
 import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
+import {
+  closeAntigravitySessions,
+  detectAntigravity,
+  runAntigravity
+} from "./antigravity.js";
 import { chatRequestSchema, respond } from "./protocol.js";
 import { z } from "zod";
 
-export type AdapterId = "claude" | "codex" | "grok";
+export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
 export type AdapterCapability = {
   id: AdapterId;
   name: string;
@@ -33,7 +38,7 @@ export type AgentBridgeAdapter = AdapterCapability & {
 
 const capabilitiesResponseSchema = z.object({
   adapters: z.array(z.object({
-    id: z.enum(["claude", "codex", "grok"]),
+    id: z.enum(["claude", "codex", "grok", "antigravity"]),
     name: z.string(),
     available: z.boolean(),
     version: z.string().nullable(),
@@ -50,7 +55,7 @@ const capabilitiesResponseSchema = z.object({
 
 const MAX_BODY = 2 * 1024 * 1024;
 
-function capabilityToken(controlToken: string, adapter: AdapterId) {
+export function capabilityToken(controlToken: string, adapter: AdapterId) {
   return createHmac("sha256", controlToken)
     .update(adapter)
     .digest("base64url");
@@ -127,9 +132,36 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export function createAgentBridge(
-  options: { controlToken?: string; preloadModels?: boolean } = {}
-) {
+import {
+  createLogger,
+  type BridgeLogger,
+  type LoggerOptions,
+  type LogLevel,
+  type LogRecord,
+  type ScopedLogger
+} from "./logger.js";
+
+export {
+  createLogger,
+  type BridgeLogger,
+  type LoggerOptions,
+  type LogLevel,
+  type LogRecord,
+  type ScopedLogger
+};
+
+export type AgentBridgeOptions = {
+  controlToken?: string;
+  preloadModels?: boolean;
+  logger?: BridgeLogger | LoggerOptions;
+};
+
+export function createAgentBridge(options: AgentBridgeOptions = {}) {
+  const logger: BridgeLogger =
+    options.logger && "debug" in options.logger
+      ? options.logger
+      : createLogger(options.logger);
+
   const controlToken =
     options.controlToken ??
     process.env.AGENT_BRIDGE_CONTROL_TOKEN ??
@@ -137,7 +169,8 @@ export function createAgentBridge(
   const tokens = {
     claude: capabilityToken(controlToken, "claude"),
     codex: capabilityToken(controlToken, "codex"),
-    grok: capabilityToken(controlToken, "grok")
+    grok: capabilityToken(controlToken, "grok"),
+    antigravity: capabilityToken(controlToken, "antigravity")
   };
   let capabilitiesPromise: Promise<AdapterCapability[]> | undefined;
   const capabilities = (refresh = false) => {
@@ -145,7 +178,8 @@ export function createAgentBridge(
     return capabilitiesPromise ??= Promise.all([
       detectClaude(),
       detectCodex(),
-      detectGrok()
+      detectGrok(),
+      detectAntigravity()
     ]);
   };
   const claude = createClaudeHandler({
@@ -155,11 +189,35 @@ export function createAgentBridge(
   });
   if (options.preloadModels) void capabilities();
   const server = createServer(async (request, response) => {
+    const startTime = Date.now();
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    const method = request.method ?? "GET";
+    const path = url.pathname;
+    const logInfo: Record<string, unknown> = { method, path };
+    response.once("finish", () => {
+      const status = response.statusCode || 200;
+      const durationMs = Date.now() - startTime;
+      const meta = {
+        method,
+        path,
+        status,
+        durationMs,
+        ...logInfo
+      };
+      if (status >= 500) {
+        logger.error("http", `${method} ${path} ${status}`, meta);
+      } else if (status >= 400) {
+        logger.warn("http", `${method} ${path} ${status}`, meta);
+      } else {
+        logger.info("http", `${method} ${path} ${status}`, meta);
+      }
+    });
+
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { ok: true });
     }
     if (request.method === "GET" && url.pathname === "/capabilities") {
+      logInfo.adapter = "control";
       if (request.headers.authorization !== `Bearer ${controlToken}`) {
         return json(response, 401, {
           error: { message: "Invalid control token" }
@@ -182,10 +240,14 @@ export function createAgentBridge(
     if (!adapter) {
       return json(response, 401, { error: { message: "Invalid API key" } });
     }
+    logInfo.adapter = adapter;
     if (adapter === "claude") return claude(request, response);
-    const runtime = adapter === "grok"
-      ? { run: runGrok, ownedBy: "grok" }
-      : { run: runCodex, ownedBy: "codex" };
+    const runtime =
+      adapter === "grok"
+        ? { run: runGrok, ownedBy: "grok" }
+        : adapter === "antigravity"
+          ? { run: runAntigravity, ownedBy: "google" }
+          : { run: runCodex, ownedBy: "codex" };
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -219,8 +281,11 @@ export function createAgentBridge(
     });
     try {
       const input = chatRequestSchema.parse(await body(request));
+      logInfo.model = input.model;
+      logInfo.stream = Boolean(input.stream);
       await pipe(await respond(input, runtime.run, controller.signal), response);
     } catch (error) {
+      logInfo.error = error instanceof Error ? error.message : String(error);
       if (response.headersSent) return response.end();
       const status = Number(record(error).status ?? 500);
       json(response, status, {
@@ -234,6 +299,7 @@ export function createAgentBridge(
   return {
     server,
     capabilities,
+    logger,
     connection(adapter: AdapterId, baseUrl: string) {
       return {
         providerId: "local-agent-bridge",
@@ -246,10 +312,13 @@ export function createAgentBridge(
       claude.close();
       await closeCodexSessions();
       await closeGrokSessions();
-      if (!server.listening) return;
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
+      await closeAntigravitySessions();
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve()))
+        );
+      }
+      await logger.close();
     }
   };
 }
@@ -322,13 +391,15 @@ export async function startAgentBridge(options: {
   port?: number;
   controlToken?: string;
   preloadModels?: boolean;
+  logger?: BridgeLogger | LoggerOptions;
 } = {}) {
   const controlToken =
     options.controlToken ?? randomBytes(32).toString("base64url");
   const bridge = await listen(
     createAgentBridge({
       controlToken,
-      preloadModels: options.preloadModels ?? true
+      preloadModels: options.preloadModels ?? true,
+      logger: options.logger
     }),
     options.port ?? 0
   );

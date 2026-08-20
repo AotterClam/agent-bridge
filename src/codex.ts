@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +32,24 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function command() {
-  return process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex";
+  return resolveCommand(process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex");
+}
+
+function resolveCommand(cmd: string): string {
+  if (process.env.AGENT_BRIDGE_CODEX_COMMAND) return process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  const home = homedir();
+  const candidates = [
+    join(home, ".local/bin", cmd),
+    join(home, ".cargo/bin", cmd),
+    join("/opt/homebrew/bin", cmd),
+    join("/usr/local/bin", cmd)
+  ];
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) return p;
+    } catch {}
+  }
+  return cmd;
 }
 
 export function codexTurnTimeoutMs(
@@ -159,17 +177,32 @@ function tokenUsage(params: Record<string, unknown>) {
 }
 
 export async function detectCodex() {
+  const cmd = command();
+  let version: string | null = null;
   try {
-    const [{ stdout: version }, { stdout }] = await Promise.all([
-      exec(command(), ["--version"], { timeout: 5_000 }),
-      exec(command(), ["debug", "models", "--bundled"], {
-        timeout: 15_000,
-        maxBuffer: 8 * 1024 * 1024
-      })
-    ]);
+    const { stdout } = await exec(cmd, ["--version"], { timeout: 5_000 });
+    version = stdout.trim();
+  } catch (error) {
+    return {
+      id: "codex" as const,
+      name: "Codex",
+      available: false,
+      version: null,
+      error: error instanceof Error ? error.message : "Codex CLI not found.",
+      models: []
+    };
+  }
+
+  try {
+    const { stdout } = await exec(cmd, ["debug", "models", "--bundled"], {
+      timeout: 10_000,
+      maxBuffer: 8 * 1024 * 1024
+    }).catch(async () => {
+      return exec(cmd, ["models"], { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+    });
     const payload = JSON.parse(stdout) as { models?: Array<Record<string, unknown>> };
     const models = (payload.models ?? [])
-      .filter((model) => model.visibility === "list")
+      .filter((model) => model.visibility === "list" || !model.visibility)
       .sort((a, b) => Number(a.priority ?? 999) - Number(b.priority ?? 999))
       .flatMap((model) => {
         if (typeof model.slug !== "string") return [];
@@ -190,7 +223,7 @@ export async function detectCodex() {
       id: "codex" as const,
       name: "Codex",
       available: models.length > 0,
-      version: version.trim(),
+      version,
       error: models.length ? null : "Codex returned no models.",
       models
     };
@@ -199,7 +232,7 @@ export async function detectCodex() {
       id: "codex" as const,
       name: "Codex",
       available: false,
-      version: null,
+      version,
       error: error instanceof Error ? error.message : "Codex unavailable.",
       models: []
     };

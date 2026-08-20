@@ -26,21 +26,22 @@
     }
   },
   "bin": {
-    "agent-bridge": "dist/cli.js"
+    "agent-bridge": "./dist/cli.js"
   },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "check": "tsc --noEmit",
     "prepack": "npm run build",
     "prestart": "npm run build",
     "start": "node dist/cli.js",
     "test": "bun test",
     "test:node": "npm run build && node tests/node-smoke.mjs",
-    "test:grok": "bun tests/grok-smoke.mjs"
+    "test:grok": "bun tests/grok-smoke.mjs",
+    "test:antigravity": "bun tests/antigravity-smoke.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.220",
