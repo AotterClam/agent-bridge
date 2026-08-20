@@ -15,7 +15,7 @@ You can use Agent Bridge in two ways:
 Run directly from any terminal to start a local server with auto-discovery, live status indicators, and ready-to-run cURL examples:
 
 ```sh
-npx @aotterclam/agent-bridge
+npx @aotterclam/agent-bridge@latest
 # or with bunx:
 bunx @aotterclam/agent-bridge
 ```
@@ -70,10 +70,10 @@ const model = createOpenAICompatible({
 
 ```sh
 # Start on default port (3457) with random control token:
-npx @aotterclam/agent-bridge
+npx @aotterclam/agent-bridge@latest
 
 # Specify custom port, discovery token, and logging:
-npx @aotterclam/agent-bridge --port 8080 --token secret-token --debug --log-file ./agent-bridge.log
+npx @aotterclam/agent-bridge@latest --port 8080 --token secret-token --debug --log-file ./agent-bridge.log
 ```
 
 Or configure via environment variables:
@@ -81,7 +81,7 @@ Or configure via environment variables:
 ```sh
 export AGENT_BRIDGE_PORT=3457
 export AGENT_BRIDGE_CONTROL_TOKEN="$(openssl rand -hex 32)"
-npx @aotterclam/agent-bridge
+npx @aotterclam/agent-bridge@latest
 ```
 
 ### CLI options
@@ -213,10 +213,10 @@ Agent Bridge features a unified, multi-transport logging subsystem aligned acros
 
 ```sh
 # Enable verbose debug logs and append to file
-npx @aotterclam/agent-bridge --debug --log-file ./agent-bridge.log
+npx @aotterclam/agent-bridge@latest --debug --log-file ./agent-bridge.log
 
 # Stream structured JSON for log aggregators (e.g. Datadog / Fluentd / CloudWatch)
-npx @aotterclam/agent-bridge --format json
+npx @aotterclam/agent-bridge@latest --format json
 ```
 
 ### In embedded mode
