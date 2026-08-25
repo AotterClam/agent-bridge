@@ -83,6 +83,50 @@ test("replays function_call items as one assistant message per burst", () => {
   expect(second.role === "tool" && second.content).toBe("fine");
 });
 
+test("rejects controls the adapters cannot honor", () => {
+  for (const overrides of [
+    { temperature: 0.2 },
+    { max_output_tokens: 100 },
+    { top_p: 0.5 },
+    { max_tool_calls: 2 },
+    { parallel_tool_calls: false },
+    { background: true },
+    { truncation: "auto" },
+    { text: { format: { type: "json_schema", schema: {} } } },
+    { include: ["reasoning.encrypted_content"] }
+  ]) {
+    expect(() => toChatRequest(request(overrides))).toThrow(
+      /does not support/
+    );
+    try {
+      toChatRequest(request(overrides));
+    } catch (error) {
+      expect((error as { status?: number }).status).toBe(400);
+    }
+  }
+  // Values equal to our actual behavior stay accepted.
+  expect(() =>
+    toChatRequest(
+      request({
+        temperature: null,
+        parallel_tool_calls: true,
+        truncation: "disabled",
+        text: { format: { type: "text" } },
+        include: []
+      })
+    )
+  ).not.toThrow();
+});
+
+test("tags translation failures as 400s", () => {
+  try {
+    toChatRequest(request({ input: [] }));
+    throw new Error("expected a validation failure");
+  } catch (error) {
+    expect((error as { status?: number }).status).toBe(400);
+  }
+});
+
 test("rejects stateful and unsupported requests loudly", () => {
   expect(() =>
     toChatRequest(request({ previous_response_id: "resp_1" }))
@@ -129,6 +173,33 @@ test("returns a completed response with message and function_call items", async 
     output_tokens: 5,
     total_tokens: 15
   });
+  // Open Responses ResponseResource required fields.
+  expect(typeof payload.completed_at).toBe("number");
+  expect(payload).toMatchObject({
+    parallel_tool_calls: true,
+    temperature: 1,
+    top_p: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+    top_logprobs: 0,
+    max_tool_calls: null,
+    truncation: "disabled",
+    service_tier: "default",
+    safety_identifier: null,
+    prompt_cache_key: null,
+    background: false
+  });
+});
+
+test("terminates the stream with a [DONE] marker", async () => {
+  const runner: ChatRunner = async () => ({
+    content: "hi",
+    toolCalls: [],
+    finishReason: "stop"
+  });
+  const response = await respondResponses(request({ stream: true }), runner);
+  const text = await response.text();
+  expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
 });
 
 test("streams semantic events across reasoning, text, and tool calls", async () => {

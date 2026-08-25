@@ -43,7 +43,22 @@ export const responsesRequestSchema = z
     stream: z.boolean().nullish(),
     reasoning: z.object({ effort: z.string().nullish() }).passthrough().nullish(),
     store: z.boolean().nullish(),
-    previous_response_id: z.string().nullish()
+    previous_response_id: z.string().nullish(),
+    max_output_tokens: z.number().nullish(),
+    temperature: z.number().nullish(),
+    top_p: z.number().nullish(),
+    top_logprobs: z.number().nullish(),
+    max_tool_calls: z.number().nullish(),
+    parallel_tool_calls: z.boolean().nullish(),
+    background: z.boolean().nullish(),
+    truncation: z.string().nullish(),
+    text: z
+      .object({
+        format: z.object({ type: z.string() }).passthrough().nullish()
+      })
+      .passthrough()
+      .nullish(),
+    include: z.array(z.unknown()).nullish()
   })
   .passthrough();
 
@@ -68,11 +83,37 @@ function partText(
     .join("");
 }
 
+/**
+ * Controls the CLI-backed adapters cannot honor. Accepting them and
+ * answering with defaults would misreport what actually ran, so any
+ * effective value is refused instead of silently dropped.
+ */
+function unsupportedControl(input: ResponsesRequest) {
+  if (input.max_output_tokens != null) return "max_output_tokens";
+  if (input.temperature != null) return "temperature";
+  if (input.top_p != null) return "top_p";
+  if (input.top_logprobs) return "top_logprobs";
+  if (input.max_tool_calls != null) return "max_tool_calls";
+  if (input.parallel_tool_calls === false) return "parallel_tool_calls: false";
+  if (input.background) return "background: true";
+  if (input.truncation && input.truncation !== "disabled") {
+    return `truncation: ${input.truncation}`;
+  }
+  const format = input.text?.format?.type;
+  if (format && format !== "text") return `text.format: ${format}`;
+  if (input.include?.length) return "include";
+  return undefined;
+}
+
 export function toChatRequest(input: ResponsesRequest): ChatRequest {
   if (input.previous_response_id) {
     badRequest(
       "previous_response_id is not supported: this bridge is stateless, send the full input array."
     );
+  }
+  const control = unsupportedControl(input);
+  if (control) {
+    badRequest(`This bridge does not support ${control}.`);
   }
   const messages: Array<Record<string, unknown>> = [];
   if (input.instructions) {
@@ -147,7 +188,7 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
     };
   });
   const choice = input.tool_choice ?? "auto";
-  return chatRequestSchema.parse({
+  const chat = chatRequestSchema.safeParse({
     model: input.model,
     messages,
     tools,
@@ -160,6 +201,8 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
       ? { reasoning_effort: input.reasoning.effort }
       : {})
   });
+  if (!chat.success) badRequest(z.prettifyError(chat.error));
+  return chat.data;
 }
 
 type OutputItem = Record<string, unknown>;
@@ -192,12 +235,14 @@ function responsePayload(
     id: context.id,
     object: "response",
     created_at: context.created,
+    completed_at: status === "completed" ? Math.floor(Date.now() / 1000) : null,
     status,
     background: false,
     error: null,
     incomplete_details: null,
     instructions: context.request.instructions ?? null,
     max_output_tokens: null,
+    max_tool_calls: null,
     model: context.request.model,
     output,
     parallel_tool_calls: true,
@@ -208,12 +253,18 @@ function responsePayload(
     },
     store: false,
     temperature: 1,
+    top_p: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+    top_logprobs: 0,
     text: { format: { type: "text" } },
     tool_choice: context.request.tool_choice ?? "auto",
     tools: context.request.tools ?? [],
-    top_p: 1,
     truncation: "disabled",
     usage: turn ? usagePayload(turn) : null,
+    service_tier: "default",
+    safety_identifier: null,
+    prompt_cache_key: null,
     user: null,
     metadata: {}
   };
@@ -495,7 +546,10 @@ export async function respondResponses(
             }
           });
         })
-        .finally(() => controller.close());
+        .finally(() => {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        });
     }
   });
   return new Response(body, {
