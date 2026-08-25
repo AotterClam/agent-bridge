@@ -332,7 +332,7 @@ class CodexSession {
         inputSchema: tool.parameters ?? { type: "object", properties: {} }
       })),
       baseInstructions:
-        "Produce exactly one assistant turn. Call host functions through the function interface when appropriate; never print a function call as text. Do not inspect files, run commands, browse, or use built-in tools."
+        "Produce exactly one assistant turn. The dynamic host functions supplied with this thread ARE enabled and are your only way to act on the user's environment: call them through the function interface whenever they fit the request, and never print a function call as text. Built-in tools are disabled, so do not inspect files, run commands, or browse yourself — but that restriction does not apply to the host functions."
     }));
     const threadId = record(started.thread).id;
     if (typeof threadId !== "string") throw new Error("Codex returned no thread id");
