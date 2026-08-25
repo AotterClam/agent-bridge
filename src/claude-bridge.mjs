@@ -1,17 +1,11 @@
-#!/usr/bin/env node
-
-import { createServer } from "node:http";
-import { pathToFileURL } from "node:url";
 import {
   createSdkMcpServer,
   query as claudeQuery,
   tool as claudeTool,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { promptFor, selectedTools } from "./protocol.js";
 
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_PORT = 3457;
-const DEFAULT_TOKEN = "dev-only";
 const TOOL_PREFIX = "mcp__openai__";
 const DEFAULT_TURN_TIMEOUT_MS = 300_000;
 // The bridge translates one OpenAI-compatible model call into exactly one
@@ -95,96 +89,6 @@ export async function discoverClaudeModels(options = {}) {
   }
 }
 
-const textPart = z.object({ type: z.literal("text"), text: z.string() });
-const content = z.union([z.string(), z.array(textPart)]);
-const functionCall = z.object({
-  id: z.string(),
-  type: z.literal("function"),
-  function: z.object({ name: z.string(), arguments: z.string() }),
-});
-const message = z.discriminatedUnion("role", [
-  z.object({ role: z.literal("system"), content }),
-  z.object({ role: z.literal("user"), content }),
-  z.object({
-    role: z.literal("assistant"),
-    content: content.nullable().optional(),
-    tool_calls: z.array(functionCall).optional(),
-  }),
-  z.object({
-    role: z.literal("tool"),
-    content,
-    tool_call_id: z.string(),
-    name: z.string().optional(),
-  }),
-]);
-const functionTool = z.object({
-  type: z.literal("function"),
-  function: z.object({
-    name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]*$/),
-    description: z.string().optional(),
-    parameters: z.record(z.string(), z.unknown()).optional(),
-  }),
-});
-const toolChoice = z.union([
-  z.enum(["auto", "none", "required"]),
-  z.object({
-    type: z.literal("function"),
-    function: z.object({ name: z.string() }),
-  }),
-]);
-const completionRequest = z
-  .object({
-    model: z.string().min(1),
-    messages: z.array(message).min(1),
-    tools: z.array(functionTool).optional().default([]),
-    tool_choice: toolChoice.optional().default("auto"),
-    stream: z.boolean().optional().default(false),
-  })
-  // OpenAI-compatible clients add optional tuning fields such as max_tokens.
-  // Validate the protocol fields this bridge consumes and ignore the rest.
-  .passthrough();
-
-function textOf(value) {
-  return typeof value === "string"
-    ? value
-    : value.map((part) => part.text).join("");
-}
-
-function promptFor(messages, choice) {
-  const transcript = messages.map((item) => {
-    if (item.role === "assistant") {
-      return {
-        role: item.role,
-        content: item.content == null ? "" : textOf(item.content),
-        tool_calls: item.tool_calls ?? [],
-      };
-    }
-    if (item.role === "tool") {
-      return {
-        role: item.role,
-        tool_call_id: item.tool_call_id,
-        name: item.name,
-        content: textOf(item.content),
-      };
-    }
-    return { role: item.role, content: textOf(item.content) };
-  });
-  const instruction =
-    choice === "required"
-      ? "You must call one of the supplied functions in this turn."
-      : typeof choice === "object"
-        ? `You must call the supplied function named ${JSON.stringify(choice.function.name)}.`
-        : choice === "none"
-          ? "Do not call a function in this turn."
-          : "Answer or call a supplied function as appropriate.";
-  return [
-    "Continue the following OpenAI chat transcript by producing exactly one assistant turn.",
-    instruction,
-    "Preserve tool-call IDs and use the supplied function schemas. Do not claim a tool result before one appears in the transcript.",
-    JSON.stringify(transcript),
-  ].join("\n\n");
-}
-
 function toolName(value) {
   const name = String(value);
   return name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : name;
@@ -196,21 +100,6 @@ function toolShape(parameters) {
     throw new Error("Function parameters must be a JSON Schema object");
   }
   return schema.shape;
-}
-
-function selectedTools(tools, choice) {
-  if (choice === "none") return [];
-  if (typeof choice === "object") {
-    const selected = tools.filter(
-      (item) => item.function.name === choice.function.name,
-    );
-    if (selected.length !== 1) throw new Error("tool_choice names an unknown function");
-    return selected;
-  }
-  if (choice === "required" && tools.length === 0) {
-    throw new Error("tool_choice is required but no functions were supplied");
-  }
-  return tools;
 }
 
 function proxyTools(tools) {
@@ -227,28 +116,14 @@ function proxyTools(tools) {
   );
 }
 
-function prepareTools(tools, choice) {
+function prepareTools(input) {
   try {
-    const selected = selectedTools(tools, choice);
+    const selected = selectedTools(input);
     return { selected, sdk: proxyTools(selected) };
   } catch (error) {
     if (error && typeof error === "object") error.status = 400;
     throw error;
   }
-}
-
-function completionId() {
-  return `chatcmpl-${crypto.randomUUID()}`;
-}
-
-function chunk(id, created, model, delta, finishReason = null) {
-  return {
-    id,
-    object: "chat.completion.chunk",
-    created,
-    model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
-  };
 }
 
 export function streamEventDelta(event, toolCallIndexes = new Map()) {
@@ -321,8 +196,7 @@ function assistantTurn(message) {
 }
 
 export async function runClaudeTurn(input, options = {}) {
-  const prepared =
-    options.preparedTools ?? prepareTools(input.tools, input.tool_choice);
+  const prepared = options.preparedTools ?? prepareTools(input);
   const tools = prepared.selected;
   const sdkTools = prepared.sdk;
   const mcpServer = sdkTools.length
@@ -409,250 +283,69 @@ export async function runClaudeTurn(input, options = {}) {
   }
 }
 
-function completionResponse(id, created, model, turn) {
-  return {
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: turn.content,
-          ...(turn.toolCalls.length ? { tool_calls: turn.toolCalls } : {}),
-        },
-        finish_reason: turn.finishReason,
-      },
-    ],
-  };
-}
-
-function errorPayload(message, type = "invalid_request_error") {
-  return { error: { message, type, param: null, code: null } };
-}
-
-function json(response, status, payload) {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  response.end(JSON.stringify(payload));
-}
-
-async function readBody(request) {
-  let bytes = 0;
-  const chunks = [];
-  for await (const chunkValue of request) {
-    const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
-    bytes += chunk.length;
-    if (bytes > MAX_BODY_BYTES) {
-      const error = new Error("Request body exceeds 2 MiB");
-      error.status = 413;
-      throw error;
-    }
-    chunks.push(chunk);
-  }
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    const error = new Error("Request body is not valid JSON");
-    error.status = 400;
-    throw error;
-  }
-}
-
-async function streamCompletion(response, input, options) {
-  response.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
-  const id = completionId();
-  const created = Math.floor(Date.now() / 1000);
-  let emittedText = false;
-  const emittedToolCallIds = new Set();
-  const toolCallIndexes = new Map();
-  const send = (payload) => response.write(`data: ${JSON.stringify(payload)}\n\n`);
-  send(chunk(id, created, input.model, { role: "assistant" }));
-  try {
-    const turn = await runClaudeTurn(input, {
-      ...options,
-      onEvent(event) {
-        const delta = streamEventDelta(event, toolCallIndexes);
-        if (!delta) return;
-        if (typeof delta.content === "string") emittedText ||= delta.content.length > 0;
-        for (const call of delta.tool_calls ?? []) {
-          if (call.id) emittedToolCallIds.add(call.id);
-        }
-        send(chunk(id, created, input.model, delta));
-      },
-    });
-    if (!emittedText && turn.content) {
-      send(chunk(id, created, input.model, { content: turn.content }));
-    }
-    for (const [index, call] of turn.toolCalls.entries()) {
-      if (!emittedToolCallIds.has(call.id)) {
-        send(chunk(id, created, input.model, {
-          tool_calls: [{ index, ...call }],
-        }));
-      }
-    }
-    send(chunk(id, created, input.model, {}, turn.finishReason));
-  } catch (error) {
-    send(errorPayload(error instanceof Error ? error.message : "Bridge failed", "server_error"));
-  } finally {
-    response.end("data: [DONE]\n\n");
-  }
-}
-
-export function createClaudeHandler(options = {}) {
-  const token = options.token ?? process.env.CC_BRIDGE_TOKEN ?? DEFAULT_TOKEN;
+/**
+ * Adapts the single-turn Claude lane to the shared ChatRunner contract, so
+ * both /v1/chat/completions and /v1/responses serve it through the same
+ * formatters as every other adapter. `defaults` (queryFn, timeoutMs) exist
+ * for tests; production callers pass none.
+ */
+export function createClaudeRunner(defaults = {}) {
   const active = new Set();
-  let modelCatalog;
-  const listModels = () => {
-    modelCatalog ??= (options.listModels?.() ?? discoverClaudeModels()).catch(
-      (error) => {
-        modelCatalog = undefined;
-        throw error;
-      },
-    );
-    return modelCatalog;
-  };
-  if (options.preloadModels) void listModels().catch(() => {});
-  const handler = async (request, response) => {
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method === "GET" && url.pathname === "/v1/models") {
-      if (request.headers.authorization !== `Bearer ${token}`) {
-        return json(response, 401, errorPayload("Invalid API key", "authentication_error"));
-      }
-      try {
-        return json(response, 200, {
-          object: "list",
-          data: (await listModels()).map((model) => ({
-            ...model,
-            object: "model",
-            created: 0,
-            owned_by: "claude-code",
-          })),
-        });
-      } catch (error) {
-        return json(
-          response,
-          500,
-          errorPayload(
-            error instanceof Error ? error.message : "Model discovery failed",
-            "server_error",
-          ),
-        );
-      }
-    }
-    if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") {
-      return json(response, 404, errorPayload("Not found"));
-    }
-    if (request.headers.authorization !== `Bearer ${token}`) {
-      return json(response, 401, errorPayload("Invalid API key", "authentication_error"));
-    }
-    if (request.headers["content-type"]?.split(";", 1)[0].trim() !== "application/json") {
-      return json(response, 400, errorPayload("Content-Type must be application/json"));
-    }
+  const runner = async (input, options = {}) => {
+    const controller = new AbortController();
+    active.add(controller);
+    const forward = () => controller.abort();
+    if (options.signal?.aborted) controller.abort();
+    else options.signal?.addEventListener("abort", forward, { once: true });
+    const toolCallIndexes = new Map();
+    let emittedText = false;
+    const emittedCallIds = new Set();
     try {
-      const parsed = completionRequest.safeParse(await readBody(request));
-      if (!parsed.success) {
-        return json(response, 400, errorPayload(z.prettifyError(parsed.error)));
-      }
-      const preparedTools = prepareTools(
-        parsed.data.tools,
-        parsed.data.tool_choice,
-      );
-      const controller = new AbortController();
-      active.add(controller);
-      const startedAt = performance.now();
-      const activeAtStart = active.size;
-      request.once("aborted", () => controller.abort());
-      response.once("close", () => {
-        if (!response.writableEnded) controller.abort();
+      const turn = await runClaudeTurn(input, {
+        queryFn: defaults.queryFn,
+        timeoutMs: defaults.timeoutMs,
+        signal: controller.signal,
+        onEvent(event) {
+          const delta = streamEventDelta(event, toolCallIndexes);
+          if (!delta) return;
+          if (typeof delta.content === "string" && delta.content) {
+            emittedText = true;
+          }
+          for (const call of delta.tool_calls ?? []) {
+            if (call.id) emittedCallIds.add(call.id);
+          }
+          options.onDelta?.(delta);
+        },
       });
-      try {
-        if (parsed.data.stream) {
-          await streamCompletion(response, parsed.data, {
-            queryFn: options.queryFn,
-            signal: controller.signal,
-            timeoutMs: options.timeoutMs,
-            preparedTools,
-          });
-        } else {
-          const id = completionId();
-          const created = Math.floor(Date.now() / 1000);
-          const turn = await runClaudeTurn(parsed.data, {
-            queryFn: options.queryFn,
-            signal: controller.signal,
-            timeoutMs: options.timeoutMs,
-            preparedTools,
-          });
-          json(response, 200, completionResponse(id, created, parsed.data.model, turn));
+      // Some models withhold streamed text or tool blocks; re-emit whatever
+      // the resolved turn carries so streaming clients still receive it.
+      if (options.onDelta) {
+        if (!emittedText && turn.content) {
+          options.onDelta({ content: turn.content });
         }
-      } finally {
-        active.delete(controller);
-        console.info(
-          "[agent-bridge.claude]",
-          JSON.stringify({
-            event: "request-finished",
-            durationMs: Math.round(performance.now() - startedAt),
-            activeAtStart,
-            activeRemaining: active.size,
-          }),
-        );
+        turn.toolCalls.forEach((call, index) => {
+          if (!emittedCallIds.has(call.id)) {
+            options.onDelta({ tool_calls: [{ index, ...call }] });
+          }
+        });
       }
-    } catch (error) {
-      const status = error?.status ?? 500;
-      if (!response.headersSent) {
-        json(
-          response,
-          status,
-          errorPayload(
-            error instanceof Error ? error.message : "Bridge failed",
-            status >= 500 ? "server_error" : "invalid_request_error",
-          ),
-        );
-      }
+      return {
+        content: turn.content,
+        toolCalls: turn.toolCalls.map((call) => ({
+          id: call.id,
+          name: call.function.name,
+          arguments: JSON.parse(call.function.arguments || "{}"),
+        })),
+        finishReason: turn.finishReason,
+      };
+    } finally {
+      active.delete(controller);
+      options.signal?.removeEventListener("abort", forward);
     }
   };
-  handler.close = () => {
+  runner.close = () => {
     for (const controller of active) controller.abort();
+    active.clear();
   };
-  return handler;
-}
-
-export function createBridgeServer(options = {}) {
-  const handler = createClaudeHandler(options);
-  const server = createServer(handler);
-  return {
-    server,
-    close: () => {
-      handler.close();
-      return new Promise((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
-    },
-  };
-}
-
-export async function startBridge() {
-  const port = Number(process.env.CC_BRIDGE_PORT ?? DEFAULT_PORT);
-  const bridge = createBridgeServer({ preloadModels: true });
-  await new Promise((resolve, reject) => {
-    bridge.server.once("error", reject);
-    bridge.server.listen(port, "127.0.0.1", resolve);
-  });
-  console.log(`cc bridge listening on http://127.0.0.1:${port}/v1`);
-  const shutdown = async () => {
-    await bridge.close();
-    process.exit(0);
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
-  return bridge;
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await startBridge();
+  return runner;
 }

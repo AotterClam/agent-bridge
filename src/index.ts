@@ -5,10 +5,8 @@ import {
   type ServerResponse
 } from "node:http";
 import {
-  createClaudeHandler,
-  discoverClaudeModels,
-  runClaudeTurn,
-  streamEventDelta
+  createClaudeRunner,
+  discoverClaudeModels
 } from "./claude-bridge.mjs";
 import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
 import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
@@ -141,37 +139,7 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-// The Claude lane keeps its own chat/completions handler; this adapts its
-// single-turn runner to the shared ChatRunner contract for /v1/responses.
-const runClaude: ChatRunner = async (input, options) => {
-  const toolCallIndexes = new Map<number, number>();
-  const turn = await runClaudeTurn(input, {
-    signal: options?.signal,
-    onEvent(event: unknown) {
-      const delta = streamEventDelta(event, toolCallIndexes) as
-        | ChatDelta
-        | undefined;
-      if (delta) options?.onDelta?.(delta);
-    }
-  });
-  return {
-    content: turn.content,
-    toolCalls: turn.toolCalls.map(
-      (call: {
-        id: string;
-        function: { name: string; arguments: string };
-      }) => ({
-        id: call.id,
-        name: call.function.name,
-        arguments: JSON.parse(call.function.arguments || "{}") as Record<
-          string,
-          unknown
-        >
-      })
-    ),
-    finishReason: turn.finishReason as ChatTurn["finishReason"]
-  };
-};
+const runClaude = createClaudeRunner() as ChatRunner & { close(): void };
 
 import {
   createLogger,
@@ -223,11 +191,6 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       detectAntigravity()
     ]);
   };
-  const claude = createClaudeHandler({
-    token: tokens.claude,
-    listModels: async () =>
-      (await capabilities()).find((adapter) => adapter.id === "claude")?.models ?? []
-  });
   if (options.preloadModels) void capabilities();
   const server = createServer(async (request, response) => {
     const startTime = Date.now();
@@ -284,15 +247,14 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     logInfo.adapter = adapter;
     const isResponses =
       request.method === "POST" && url.pathname === "/v1/responses";
-    if (adapter === "claude" && !isResponses) {
-      return claude(request, response);
-    }
     const runtime =
-      adapter === "grok"
-        ? { run: runGrok, ownedBy: "grok" }
-        : adapter === "antigravity"
-          ? { run: runAntigravity, ownedBy: "google" }
-          : { run: runCodex, ownedBy: "codex" };
+      adapter === "claude"
+        ? { run: runClaude, ownedBy: "claude-code" }
+        : adapter === "grok"
+          ? { run: runGrok, ownedBy: "grok" }
+          : adapter === "antigravity"
+            ? { run: runAntigravity, ownedBy: "google" }
+            : { run: runCodex, ownedBy: "codex" };
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -334,17 +296,24 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         }
         logInfo.model = parsed.data.model;
         logInfo.stream = Boolean(parsed.data.stream);
-        const runner = adapter === "claude" ? runClaude : runtime.run;
         await pipe(
-          await respondResponses(parsed.data, runner, controller.signal),
+          await respondResponses(parsed.data, runtime.run, controller.signal),
           response
         );
         return;
       }
-      const input = chatRequestSchema.parse(await body(request));
-      logInfo.model = input.model;
-      logInfo.stream = Boolean(input.stream);
-      await pipe(await respond(input, runtime.run, controller.signal), response);
+      const parsed = chatRequestSchema.safeParse(await body(request));
+      if (!parsed.success) {
+        throw Object.assign(new Error(z.prettifyError(parsed.error)), {
+          status: 400
+        });
+      }
+      logInfo.model = parsed.data.model;
+      logInfo.stream = Boolean(parsed.data.stream);
+      await pipe(
+        await respond(parsed.data, runtime.run, controller.signal),
+        response
+      );
     } catch (error) {
       logInfo.error = error instanceof Error ? error.message : String(error);
       if (response.headersSent) return response.end();
@@ -370,7 +339,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       };
     },
     async close() {
-      claude.close();
+      runClaude.close();
       await closeCodexSessions();
       await closeGrokSessions();
       await closeAntigravitySessions();
