@@ -41,7 +41,13 @@ export const responsesRequestSchema = z
       ])
       .nullish(),
     stream: z.boolean().nullish(),
-    reasoning: z.object({ effort: z.string().nullish() }).passthrough().nullish(),
+    reasoning: z
+      .object({
+        effort: z.string().nullish(),
+        summary: z.string().nullish()
+      })
+      .passthrough()
+      .nullish(),
     store: z.boolean().nullish(),
     previous_response_id: z.string().nullish(),
     max_output_tokens: z.number().nullish(),
@@ -58,7 +64,14 @@ export const responsesRequestSchema = z
       })
       .passthrough()
       .nullish(),
-    include: z.array(z.unknown()).nullish()
+    include: z.array(z.unknown()).nullish(),
+    presence_penalty: z.number().nullish(),
+    frequency_penalty: z.number().nullish(),
+    service_tier: z.string().nullish(),
+    metadata: z.record(z.string(), z.unknown()).nullish(),
+    safety_identifier: z.string().nullish(),
+    prompt_cache_key: z.string().nullish(),
+    stream_options: z.record(z.string(), z.unknown()).nullish()
   })
   .passthrough();
 
@@ -102,6 +115,17 @@ function unsupportedControl(input: ResponsesRequest) {
   const format = input.text?.format?.type;
   if (format && format !== "text") return `text.format: ${format}`;
   if (input.include?.length) return "include";
+  if (input.presence_penalty) return "presence_penalty";
+  if (input.frequency_penalty) return "frequency_penalty";
+  if (
+    input.service_tier != null &&
+    input.service_tier !== "auto" &&
+    input.service_tier !== "default"
+  ) {
+    return `service_tier: ${input.service_tier}`;
+  }
+  if (input.reasoning?.summary != null) return "reasoning.summary";
+  if (input.stream_options != null) return "stream_options";
   return undefined;
 }
 
@@ -263,10 +287,10 @@ function responsePayload(
     truncation: "disabled",
     usage: turn ? usagePayload(turn) : null,
     service_tier: "default",
-    safety_identifier: null,
-    prompt_cache_key: null,
+    safety_identifier: context.request.safety_identifier ?? null,
+    prompt_cache_key: context.request.prompt_cache_key ?? null,
     user: null,
-    metadata: {}
+    metadata: context.request.metadata ?? {}
   };
 }
 
