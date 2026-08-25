@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
+  HOST_TOOL_INSTRUCTIONS,
   promptFor,
   selectedTools,
   type ChatRequest,
@@ -331,8 +332,7 @@ class CodexSession {
         description: tool.description ?? "",
         inputSchema: tool.parameters ?? { type: "object", properties: {} }
       })),
-      baseInstructions:
-        "Produce exactly one assistant turn. The dynamic host functions supplied with this thread ARE enabled and are your only way to act on the user's environment: call them through the function interface whenever they fit the request, and never print a function call as text. Built-in tools are disabled, so do not inspect files, run commands, or browse yourself — but that restriction does not apply to the host functions."
+      baseInstructions: HOST_TOOL_INSTRUCTIONS
     }));
     const threadId = record(started.thread).id;
     if (typeof threadId !== "string") throw new Error("Codex returned no thread id");

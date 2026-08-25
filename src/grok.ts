@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
+  HOST_TOOL_INSTRUCTIONS,
   promptFor,
   selectedTools,
   type ChatRequest,
@@ -465,8 +466,7 @@ class GrokSession {
         : [],
       _meta: {
         yoloMode: false,
-        systemPromptOverride:
-          "Produce exactly one assistant turn. Call host functions through the function interface when appropriate; never print a function call as text. Do not inspect files, run commands, browse, or use built-in tools."
+        systemPromptOverride: HOST_TOOL_INSTRUCTIONS
       }
     }));
     if (typeof started.sessionId !== "string") {
