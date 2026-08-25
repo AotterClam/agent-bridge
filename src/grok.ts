@@ -419,13 +419,12 @@ class GrokSession {
 
   static async create(input: ChatRequest) {
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-grok-"));
+    // Built-in read tools must stay on: Grok externalizes long prompts to a
+    // file the model reads back with read_file/grep (--disallowed-tools does
+    // not remove them anyway — verified 2026-08-25). hostToolCall's use_tool
+    // gate is what keeps built-in runs from leaking out as host calls.
     const args = [
       "--no-auto-update",
-      // Built-in tools that shadow common host tool names or touch the
-      // machine; the model must reach the environment via MCP host tools
-      // only. search_tool stays: it is how Grok discovers MCP tools.
-      "--disallowed-tools",
-      "read_file,write_file,edit_file,list_files,bash",
       "--disable-web-search",
       "agent",
       "--no-leader"
