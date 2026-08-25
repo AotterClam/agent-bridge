@@ -6,7 +6,9 @@ import {
 } from "node:http";
 import {
   createClaudeHandler,
-  discoverClaudeModels
+  discoverClaudeModels,
+  runClaudeTurn,
+  streamEventDelta
 } from "./claude-bridge.mjs";
 import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
 import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
@@ -15,7 +17,14 @@ import {
   detectAntigravity,
   runAntigravity
 } from "./antigravity.js";
-import { chatRequestSchema, respond } from "./protocol.js";
+import {
+  chatRequestSchema,
+  respond,
+  type ChatDelta,
+  type ChatRunner,
+  type ChatTurn
+} from "./protocol.js";
+import { respondResponses, responsesRequestSchema } from "./responses.js";
 import { z } from "zod";
 
 export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
@@ -132,6 +141,38 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+// The Claude lane keeps its own chat/completions handler; this adapts its
+// single-turn runner to the shared ChatRunner contract for /v1/responses.
+const runClaude: ChatRunner = async (input, options) => {
+  const toolCallIndexes = new Map<number, number>();
+  const turn = await runClaudeTurn(input, {
+    signal: options?.signal,
+    onEvent(event: unknown) {
+      const delta = streamEventDelta(event, toolCallIndexes) as
+        | ChatDelta
+        | undefined;
+      if (delta) options?.onDelta?.(delta);
+    }
+  });
+  return {
+    content: turn.content,
+    toolCalls: turn.toolCalls.map(
+      (call: {
+        id: string;
+        function: { name: string; arguments: string };
+      }) => ({
+        id: call.id,
+        name: call.function.name,
+        arguments: JSON.parse(call.function.arguments || "{}") as Record<
+          string,
+          unknown
+        >
+      })
+    ),
+    finishReason: turn.finishReason as ChatTurn["finishReason"]
+  };
+};
+
 import {
   createLogger,
   type BridgeLogger,
@@ -241,7 +282,11 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       return json(response, 401, { error: { message: "Invalid API key" } });
     }
     logInfo.adapter = adapter;
-    if (adapter === "claude") return claude(request, response);
+    const isResponses =
+      request.method === "POST" && url.pathname === "/v1/responses";
+    if (adapter === "claude" && !isResponses) {
+      return claude(request, response);
+    }
     const runtime =
       adapter === "grok"
         ? { run: runGrok, ownedBy: "grok" }
@@ -262,8 +307,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       });
     }
     if (
-      request.method !== "POST" ||
-      url.pathname !== "/v1/chat/completions"
+      !isResponses &&
+      (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
     ) {
       return json(response, 404, { error: { message: "Not found" } });
     }
@@ -280,6 +325,22 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       if (!response.writableEnded) controller.abort();
     });
     try {
+      if (isResponses) {
+        const parsed = responsesRequestSchema.safeParse(await body(request));
+        if (!parsed.success) {
+          throw Object.assign(new Error(z.prettifyError(parsed.error)), {
+            status: 400
+          });
+        }
+        logInfo.model = parsed.data.model;
+        logInfo.stream = Boolean(parsed.data.stream);
+        const runner = adapter === "claude" ? runClaude : runtime.run;
+        await pipe(
+          await respondResponses(parsed.data, runner, controller.signal),
+          response
+        );
+        return;
+      }
       const input = chatRequestSchema.parse(await body(request));
       logInfo.model = input.model;
       logInfo.stream = Boolean(input.stream);
