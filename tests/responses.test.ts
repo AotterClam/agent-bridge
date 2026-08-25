@@ -98,7 +98,9 @@ test("rejects controls the adapters cannot honor", () => {
     { frequency_penalty: -0.3 },
     { service_tier: "flex" },
     { reasoning: { summary: "detailed" } },
-    { stream_options: { include_usage: true } }
+    { stream_options: { include_usage: true } },
+    { safety_identifier: "user-42" },
+    { prompt_cache_key: "cache-key-9" }
   ]) {
     expect(() => toChatRequest(request(overrides))).toThrow(
       /does not support/
@@ -126,7 +128,7 @@ test("rejects controls the adapters cannot honor", () => {
   ).not.toThrow();
 });
 
-test("echoes the request fields the bridge can honor", async () => {
+test("echoes metadata", async () => {
   const runner: ChatRunner = async () => ({
     content: "ok",
     toolCalls: [],
@@ -134,16 +136,12 @@ test("echoes the request fields the bridge can honor", async () => {
   });
   const response = await respondResponses(
     request({
-      metadata: { task: "t-1" },
-      safety_identifier: "user-42",
-      prompt_cache_key: "cache-key-9"
+      metadata: { task: "t-1" }
     }),
     runner
   );
   const payload = (await response.json()) as Record<string, any>;
   expect(payload.metadata).toEqual({ task: "t-1" });
-  expect(payload.safety_identifier).toBe("user-42");
-  expect(payload.prompt_cache_key).toBe("cache-key-9");
 });
 
 test("tags translation failures as 400s", () => {

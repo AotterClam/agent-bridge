@@ -126,6 +126,8 @@ function unsupportedControl(input: ResponsesRequest) {
   }
   if (input.reasoning?.summary != null) return "reasoning.summary";
   if (input.stream_options != null) return "stream_options";
+  if (input.safety_identifier != null) return "safety_identifier";
+  if (input.prompt_cache_key != null) return "prompt_cache_key";
   return undefined;
 }
 
@@ -287,8 +289,8 @@ function responsePayload(
     truncation: "disabled",
     usage: turn ? usagePayload(turn) : null,
     service_tier: "default",
-    safety_identifier: context.request.safety_identifier ?? null,
-    prompt_cache_key: context.request.prompt_cache_key ?? null,
+    safety_identifier: null,
+    prompt_cache_key: null,
     user: null,
     metadata: context.request.metadata ?? {}
   };
