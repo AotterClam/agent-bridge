@@ -241,7 +241,15 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
   };
 }
 
-function hostToolCall(update: Record<string, unknown>, allowed?: ReadonlySet<string>) {
+export function hostToolCall(update: Record<string, unknown>, allowed?: ReadonlySet<string>) {
+  // Grok tags every tool event with x.ai/tool metadata, and only its
+  // use_tool wrapper dispatches MCP (host) calls. Name matching alone is
+  // unsafe: hosts legitimately register tools named like Grok built-ins
+  // (read_file), and treating a built-in run as a host call desyncs both
+  // sides — Grok reads its empty sandbox while the host executes a call
+  // Grok never routed to it.
+  const kind = record(record(update._meta)["x.ai/tool"]).kind;
+  if (kind && kind !== "use_tool") return;
   const raw = record(update.rawInput);
   const qualified = String(raw.tool_name ?? update.title ?? "");
   const name = qualified.startsWith(HOST_PREFIX)
@@ -364,6 +372,11 @@ async function startHostTools(tools: ChatRequest["tools"]) {
   };
 }
 
+const debugLog = process.env.AGENT_BRIDGE_GROK_DEBUG
+  ? (label: string, value: unknown) =>
+      console.info(`[grok-debug] ${label} ${JSON.stringify(value)}`)
+  : undefined;
+
 const pendingCalls = new Map<string, GrokSession>();
 const sessions = new Set<GrokSession>();
 
@@ -406,7 +419,17 @@ class GrokSession {
 
   static async create(input: ChatRequest) {
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-grok-"));
-    const args = ["--no-auto-update", "agent", "--no-leader"];
+    const args = [
+      "--no-auto-update",
+      // Built-in tools that shadow common host tool names or touch the
+      // machine; the model must reach the environment via MCP host tools
+      // only. search_tool stays: it is how Grok discovers MCP tools.
+      "--disallowed-tools",
+      "read_file,write_file,edit_file,list_files,bash",
+      "--disable-web-search",
+      "agent",
+      "--no-leader"
+    ];
     if (input.model) args.push("--model", input.model);
     if (input.reasoning_effort) args.push("--reasoning-effort", input.reasoning_effort);
     args.push("stdio");
@@ -543,6 +566,7 @@ class GrokSession {
 
   private onMessage(message: RpcMessage) {
     if (message.method === "session/request_permission" && message.id != null) {
+      debugLog?.("request_permission", message.params);
       const options = Array.isArray(message.params?.options) ? message.params.options : [];
       const hostTool = hostToolCall(record(message.params?.toolCall), this.hostToolNames);
       const optionId = options
@@ -570,9 +594,16 @@ class GrokSession {
       if (text) this.waiter?.options.onDelta?.({ reasoning_content: text });
       return;
     }
-    if (kind !== "tool_call") return;
+    if (kind !== "tool_call") {
+      if (kind !== "tool_call_update" && debugLog) debugLog("update", update);
+      return;
+    }
     const call = hostToolCall(update, this.hostToolNames);
-    if (!call) return;
+    if (!call) {
+      debugLog?.("ignored tool_call", update);
+      return;
+    }
+    debugLog?.("host tool_call", update);
     if (this.seenToolCalls.has(call.id)) return;
     this.seenToolCalls.add(call.id);
     this.pendingToolCalls.push(call);
