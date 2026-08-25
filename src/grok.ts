@@ -322,6 +322,9 @@ async function startHostTools(tools: ChatRequest["tools"]) {
         return;
       }
       if (payload.method === "tools/list") {
+        debugLog?.("mcp tools/list served", {
+          tools: tools.map(({ function: tool }) => tool.name)
+        });
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           jsonrpc: "2.0",
@@ -337,6 +340,7 @@ async function startHostTools(tools: ChatRequest["tools"]) {
         return;
       }
       if (payload.method === "tools/call") {
+        debugLog?.("mcp tools/call", payload.params ?? {});
         pending.push({ id: payload.id, response });
         respond();
         return;
