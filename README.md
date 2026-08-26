@@ -89,7 +89,7 @@ npx @aotterclam/agent-bridge@latest
 | Option | Shorthand | Description |
 | :--- | :--- | :--- |
 | `--port <number>` | `-p` | Port to listen on (default: `3457` or `AGENT_BRIDGE_PORT`) |
-| `--token <string>` | `-t` | Control token for discovery (default: `AGENT_BRIDGE_CONTROL_TOKEN` or `local-development-only`) |
+| `--token <string>` | `-t` | Control token for discovery (default: `AGENT_BRIDGE_CONTROL_TOKEN` or a random token per run) |
 | `--log-level <level>` | `-l` | Log verbosity: `debug`, `info`, `warn`, `error`, `silent` (default: `info`) |
 | `--debug` | `-d` | Shorthand for `--log-level debug` |
 | `--log-file <path>` | `-f` | Append structured logs to specified file path |
@@ -443,8 +443,7 @@ curl http://127.0.0.1:3457/v1/responses \
   -d '{
     "model":"<MODEL_ID>",
     "input":"Draw a pearl inside a friendly clam",
-    "tools":[{"type":"image_generation"}],
-    "tool_choice":"required"
+    "tools":[{"type":"image_generation"}]
   }'
 ```
 
@@ -481,7 +480,7 @@ The external runner covers `/v1/images/*`; the repository tests cover the `/v1/r
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `AGENT_BRIDGE_PORT` | `3457` | Standalone listener port |
-| `AGENT_BRIDGE_CONTROL_TOKEN` | `local-development-only` | Standalone discovery token |
+| `AGENT_BRIDGE_CONTROL_TOKEN` | random per run | Optional fixed standalone discovery token |
 | `AGENT_BRIDGE_LOG_LEVEL` | `info` | Default log level (`debug`, `info`, `warn`, `error`, `silent`) |
 | `AGENT_BRIDGE_LOG_FILE` | - | Default file path for structured log output |
 | `AGENT_BRIDGE_LOG_FORMAT` | `pretty` | Log output style (`pretty` or `json`) |
@@ -492,6 +491,8 @@ The external runner covers `/v1/images/*`; the repository tests cover the `/v1/r
 | `AGENT_BRIDGE_CODEX_COMMAND` | `codex` | Codex executable |
 | `AGENT_BRIDGE_GROK_TIMEOUT_MS` | `300000` | Grok turn timeout |
 | `AGENT_BRIDGE_GROK_COMMAND` | `grok` | Grok executable |
+
+Upgrade notes: [v0.1.13](docs/migrations/v0.1.13.md).
 
 ---
 

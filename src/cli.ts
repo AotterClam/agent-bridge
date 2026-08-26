@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
 import {
@@ -52,7 +53,7 @@ ${c.bold("Usage:")}
 
 ${c.bold("Options:")}
   -p, --port <number>         Port to listen on (default: 3457 or AGENT_BRIDGE_PORT)
-  -t, --token <string>        Control token for discovery (default: AGENT_BRIDGE_CONTROL_TOKEN or 'local-development-only')
+  -t, --token <string>        Control token for discovery (default: env or random)
   -l, --log-level <level>     Log verbosity: debug | info | warn | error | silent (default: info)
   -d, --debug                 Shortcut for --log-level debug
   -f, --log-file <path>       Append logs to specified file path
@@ -63,7 +64,7 @@ ${c.bold("Options:")}
 
 ${c.bold("Environment Variables:")}
   AGENT_BRIDGE_PORT                   Default listener port (default: 3457)
-  AGENT_BRIDGE_CONTROL_TOKEN          Default discovery token (default: local-development-only)
+  AGENT_BRIDGE_CONTROL_TOKEN          Fixed discovery token (default: random per run)
   AGENT_BRIDGE_LOG_LEVEL              Log verbosity level (default: info)
   AGENT_BRIDGE_LOG_FILE               Destination file path for logging
   AGENT_BRIDGE_LOG_FORMAT             Log output format: pretty | json
@@ -276,7 +277,7 @@ async function main() {
   const controlToken: string =
     values.token ??
     process.env.AGENT_BRIDGE_CONTROL_TOKEN ??
-    "local-development-only";
+    randomBytes(32).toString("base64url");
 
   let logLevel: LogLevel = "info";
   if (values.quiet) {

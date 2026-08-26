@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  createAgentBridge,
   createAgentBridgeClient
 } from "../src/index.js";
 
@@ -18,6 +19,18 @@ const response = {
     }]
   }]
 };
+
+test("generates a fresh default control token for each bridge", async () => {
+  const first = createAgentBridge({ preloadModels: false });
+  const second = createAgentBridge({ preloadModels: false });
+  try {
+    expect(first.connection("codex", "http://127.0.0.1").apiKey).not.toBe(
+      second.connection("codex", "http://127.0.0.1").apiKey
+    );
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+  }
+});
 
 test("selects an adapter and refreshes capabilities", async () => {
   expect(() => createAgentBridgeClient({

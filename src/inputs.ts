@@ -18,7 +18,7 @@ export const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 
 export type ImageInput = {
   url: string;
-  detail?: "auto" | "low" | "high";
+  detail?: "auto" | "low" | "high" | "original";
 };
 export type AudioInput = { data: string; format: "wav" | "mp3" };
 export type FileInput = {
