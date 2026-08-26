@@ -90,6 +90,15 @@ export type ChatRunner = (
   options?: { signal?: AbortSignal; onDelta?: (delta: ChatDelta) => void }
 ) => Promise<ChatTurn>;
 
+/**
+ * Session-level contract for adapters whose runtime exposes host functions
+ * natively (Codex dynamicTools, Grok host tools). One wording, one place:
+ * codex-cli 0.144 showed the models read this closely, and a lane keeping
+ * its own copy regresses alone (2eb7c38, 204ecb9).
+ */
+export const HOST_TOOL_INSTRUCTIONS =
+  "Produce exactly one assistant turn. The dynamic host functions supplied with this session ARE enabled and are your only way to act on the user's environment: call them through the function interface whenever they fit the request, and never print a function call as text. Built-in tools are disabled, so do not inspect files, run commands, or browse yourself — but that restriction does not apply to the host functions.";
+
 function text(value: z.infer<typeof textContent>) {
   return typeof value === "string"
     ? value

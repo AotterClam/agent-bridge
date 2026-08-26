@@ -155,6 +155,17 @@ curl http://127.0.0.1:3457/v1/chat/completions \
   }'
 ```
 
+6. Same turn over the stateless **Responses API** (any adapter):
+```sh
+curl http://127.0.0.1:3457/v1/responses \
+  -H "Authorization: Bearer <CLAUDE_CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-5[1m]",
+    "input": "Explain quantum computing in one sentence."
+  }'
+```
+
 ### Client SDK connection
 
 Connect to a standalone bridge using the client SDK:
@@ -325,9 +336,12 @@ GET  /health
 GET  /capabilities
 GET  /v1/models
 POST /v1/chat/completions
+POST /v1/responses
 ```
 
 Chat completions support standard JSON and SSE streaming responses, OpenAI function-tool calls, and reasoning deltas. The `/v1` routes form the OpenAI-compatible data plane; `/capabilities` uses the separate control token for local discovery.
+
+`/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. Nothing is stored server-side, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
 ---
 

@@ -535,6 +535,10 @@ export function promptForAntigravity(input: ChatRequest) {
   const tools = selectedTools(input);
   const basePrompt = promptFor(input.messages, input.tool_choice);
 
+  // Antigravity has no native function interface — tool calls travel as JSON
+  // text per the protocol below — so it keeps its own wording instead of
+  // HOST_TOOL_INSTRUCTIONS. The one-turn line repeats in basePrompt, but the
+  // opening copy is load-bearing: without it AGY reaches for built-in tools.
   const sections = [
     "Produce exactly one assistant turn for this OpenAI chat transcript.",
     "IMPORTANT INSTRUCTION: You are acting strictly as an OpenAI LLM backend. Do NOT run commands, do NOT inspect files, do NOT browse, and do NOT use or call any built-in CLI tools or built-in functions."

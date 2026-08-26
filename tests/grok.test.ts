@@ -5,11 +5,54 @@ import { join } from "node:path";
 import {
   closeGrokSessions,
   detectGrok,
+  hostToolCall,
   modelsFromGrokInitialize,
   parseGrokModels,
   runGrok
 } from "../src/grok.js";
 import { chatRequestSchema } from "../src/protocol.js";
+
+test("routes only use_tool events to the host, even on name collisions", () => {
+  const allowed = new Set(["read_file"]);
+  // Grok's own read_file — same name as a host tool — must stay built-in.
+  expect(
+    hostToolCall(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "call-1",
+        title: "read_file",
+        rawInput: { path: "a.txt" },
+        _meta: { "x.ai/tool": { kind: "read_file", namespace: "grok_build" } }
+      },
+      allowed
+    )
+  ).toBeUndefined();
+  // The MCP dispatch wrapper is a host call.
+  expect(
+    hostToolCall(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "call-2",
+        title: "use_tool",
+        rawInput: { tool_name: "openai__read_file", tool_input: { path: "a.txt" } },
+        _meta: { "x.ai/tool": { kind: "use_tool", namespace: "grok_build" } }
+      },
+      allowed
+    )
+  ).toEqual({ id: "call-2", name: "read_file", arguments: { path: "a.txt" } });
+  // Legacy events without metadata keep the allowed-set fallback (6d1f558).
+  expect(
+    hostToolCall(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "call-3",
+        title: "read_file",
+        rawInput: { tool_input: { path: "a.txt" } }
+      },
+      allowed
+    )
+  ).toEqual({ id: "call-3", name: "read_file", arguments: { path: "a.txt" } });
+});
 
 test("parses grok models output", () => {
   expect(parseGrokModels(`You are logged in with grok.com.

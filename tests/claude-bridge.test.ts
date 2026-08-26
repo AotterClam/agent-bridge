@@ -1,17 +1,16 @@
-import { afterEach, expect, test } from "bun:test";
-import { once } from "node:events";
+import { expect, test } from "bun:test";
 import {
-  createBridgeServer,
+  createClaudeRunner,
   discoverClaudeModels,
   runClaudeTurn,
   streamEventDelta
 } from "../src/claude-bridge.mjs";
-
-const servers: Array<ReturnType<typeof createBridgeServer>> = [];
-
-afterEach(async () => {
-  await Promise.all(servers.splice(0).map((bridge) => bridge.close()));
-});
+import {
+  chatRequestSchema,
+  respond,
+  type ChatDelta,
+  type ChatRunner
+} from "../src/protocol.js";
 
 const input = {
   model: "claude-sonnet",
@@ -130,15 +129,7 @@ test("distinguishes an upstream cancellation from a timeout", async () => {
 });
 
 test("keeps the lumen-next OpenAI streaming contract", async () => {
-  const bridge = createBridgeServer({
-    token: "test-token",
-    listModels: async () => [
-      {
-        id: "claude-sonnet",
-        name: "claude-sonnet",
-        description: "Sonnet"
-      }
-    ],
+  const runner = createClaudeRunner({
     queryFn: () =>
       Object.assign(
         (async function* () {
@@ -159,31 +150,50 @@ test("keeps the lumen-next OpenAI streaming contract", async () => {
         { close() {} }
       )
   });
-  servers.push(bridge);
-  bridge.server.listen(0, "127.0.0.1");
-  await once(bridge.server, "listening");
-  const address = bridge.server.address();
-  if (!address || typeof address === "string") throw new Error("Missing port");
-  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
-  const headers = {
-    authorization: "Bearer test-token",
-    "content-type": "application/json"
-  };
-
-  const models = await fetch(`${baseUrl}/models`, { headers });
-  expect(models.status).toBe(200);
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const response = await respond(
+    chatRequestSchema.parse({
       model: "claude-sonnet",
       messages: [{ role: "user", content: "Hello" }],
       stream: true
-    })
-  });
+    }),
+    runner as ChatRunner
+  );
   const text = await response.text();
   expect(text).toContain('"content":"hello"');
   expect(text).toContain('"finish_reason":"stop"');
   expect(text).toContain("data: [DONE]");
+});
+
+test("re-emits content and tool calls the SDK resolved without streaming", async () => {
+  const runner = createClaudeRunner({
+    queryFn: () =>
+      Object.assign(
+        (async function* () {
+          yield {
+            type: "assistant",
+            parent_tool_use_id: null,
+            message: {
+              content: [
+                { type: "text", text: "calling" },
+                { type: "tool_use", id: "toolu_1", name: "mcp__openai__lookup", input: { q: 1 } }
+              ]
+            }
+          };
+        })(),
+        { close() {} }
+      )
+  });
+  const deltas: unknown[] = [];
+  const turn = await runner(
+    chatRequestSchema.parse({
+      model: "claude-sonnet",
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [{ type: "function", function: { name: "lookup" } }]
+    }),
+    { onDelta: (delta: ChatDelta) => deltas.push(delta) }
+  );
+  expect(turn.toolCalls).toEqual([{ id: "toolu_1", name: "lookup", arguments: { q: 1 } }]);
+  expect(turn.finishReason).toBe("tool_calls");
+  expect(JSON.stringify(deltas)).toContain('"content":"calling"');
+  expect(JSON.stringify(deltas)).toContain('"name":"lookup"');
 });

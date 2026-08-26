@@ -155,10 +155,12 @@ function renderAdapterStatus(
         const m = a.models[j]!;
         const col1 = j === 0 ? c.cyan(a.id) : "";
         const col2 = m.id;
-        let efforts = m.reasoningEfforts.join(", ");
-        if (m.defaultReasoningEffort) {
-          efforts += ` ${c.dim(`(def: ${m.defaultReasoningEffort})`)}`;
-        } else if (efforts.length === 0) {
+        let efforts = m.reasoningEfforts
+          .map((effort) =>
+            effort === m.defaultReasoningEffort ? `${effort}*` : effort
+          )
+          .join(", ");
+        if (efforts.length === 0) {
           efforts = c.dim("-");
         }
 
@@ -177,6 +179,9 @@ function renderAdapterStatus(
       }
     }
     console.log(botBorder);
+    if (online.some((a) => a.models.some((m) => m.defaultReasoningEffort))) {
+      console.log(c.dim("  * = default reasoning effort"));
+    }
 
     // Quick cURL examples with real tokens
     console.log(`\n${c.bold("Ready-to-run cURL Examples:")}`);
@@ -194,6 +199,17 @@ function renderAdapterStatus(
         `  -d '{"model": "${defaultModel}", "messages": [{"role": "user", "content": "Hello!"}]}'\n`
       );
     }
+
+    const first = online[0]!;
+    const firstModel = first.models[0]?.id ?? "default";
+    console.log(c.dim("# Every adapter also serves the stateless Responses API at /v1/responses:"));
+    console.log(c.dim(`# same capability token, but the body takes "input" instead of "messages". E.g. ${first.name}:`));
+    console.log(
+      `curl ${baseUrl}/v1/responses \\\n` +
+      `  -H "Authorization: Bearer ${capabilityToken(controlToken, first.id as AdapterId)}" \\\n` +
+      `  -H "Content-Type: application/json" \\\n` +
+      `  -d '{"model": "${firstModel}", "input": "Hello!"}'\n`
+    );
   }
 
   console.log(`${c.green("✔")} Ready for OpenAI requests. Press ${c.bold("Ctrl+C")} to stop.\n`);

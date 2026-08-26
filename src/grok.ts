@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
+  HOST_TOOL_INSTRUCTIONS,
   promptFor,
   selectedTools,
   type ChatRequest,
@@ -240,7 +241,15 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
   };
 }
 
-function hostToolCall(update: Record<string, unknown>, allowed?: ReadonlySet<string>) {
+export function hostToolCall(update: Record<string, unknown>, allowed?: ReadonlySet<string>) {
+  // Grok tags every tool event with x.ai/tool metadata, and only its
+  // use_tool wrapper dispatches MCP (host) calls. Name matching alone is
+  // unsafe: hosts legitimately register tools named like Grok built-ins
+  // (read_file), and treating a built-in run as a host call desyncs both
+  // sides — Grok reads its empty sandbox while the host executes a call
+  // Grok never routed to it.
+  const kind = record(record(update._meta)["x.ai/tool"]).kind;
+  if (kind && kind !== "use_tool") return;
   const raw = record(update.rawInput);
   const qualified = String(raw.tool_name ?? update.title ?? "");
   const name = qualified.startsWith(HOST_PREFIX)
@@ -313,6 +322,9 @@ async function startHostTools(tools: ChatRequest["tools"]) {
         return;
       }
       if (payload.method === "tools/list") {
+        debugLog?.("mcp tools/list served", {
+          tools: tools.map(({ function: tool }) => tool.name)
+        });
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           jsonrpc: "2.0",
@@ -328,6 +340,7 @@ async function startHostTools(tools: ChatRequest["tools"]) {
         return;
       }
       if (payload.method === "tools/call") {
+        debugLog?.("mcp tools/call", payload.params ?? {});
         pending.push({ id: payload.id, response });
         respond();
         return;
@@ -362,6 +375,11 @@ async function startHostTools(tools: ChatRequest["tools"]) {
     }
   };
 }
+
+const debugLog = process.env.AGENT_BRIDGE_GROK_DEBUG
+  ? (label: string, value: unknown) =>
+      console.info(`[grok-debug] ${label} ${JSON.stringify(value)}`)
+  : undefined;
 
 const pendingCalls = new Map<string, GrokSession>();
 const sessions = new Set<GrokSession>();
@@ -405,7 +423,16 @@ class GrokSession {
 
   static async create(input: ChatRequest) {
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-grok-"));
-    const args = ["--no-auto-update", "agent", "--no-leader"];
+    // Built-in read tools must stay on: Grok externalizes long prompts to a
+    // file the model reads back with read_file/grep (--disallowed-tools does
+    // not remove them anyway — verified 2026-08-25). hostToolCall's use_tool
+    // gate is what keeps built-in runs from leaking out as host calls.
+    const args = [
+      "--no-auto-update",
+      "--disable-web-search",
+      "agent",
+      "--no-leader"
+    ];
     if (input.model) args.push("--model", input.model);
     if (input.reasoning_effort) args.push("--reasoning-effort", input.reasoning_effort);
     args.push("stdio");
@@ -465,8 +492,7 @@ class GrokSession {
         : [],
       _meta: {
         yoloMode: false,
-        systemPromptOverride:
-          "Produce exactly one assistant turn. Call host functions through the function interface when appropriate; never print a function call as text. Do not inspect files, run commands, browse, or use built-in tools."
+        systemPromptOverride: HOST_TOOL_INSTRUCTIONS
       }
     }));
     if (typeof started.sessionId !== "string") {
@@ -543,6 +569,7 @@ class GrokSession {
 
   private onMessage(message: RpcMessage) {
     if (message.method === "session/request_permission" && message.id != null) {
+      debugLog?.("request_permission", message.params);
       const options = Array.isArray(message.params?.options) ? message.params.options : [];
       const hostTool = hostToolCall(record(message.params?.toolCall), this.hostToolNames);
       const optionId = options
@@ -570,9 +597,16 @@ class GrokSession {
       if (text) this.waiter?.options.onDelta?.({ reasoning_content: text });
       return;
     }
-    if (kind !== "tool_call") return;
+    if (kind !== "tool_call") {
+      if (kind !== "tool_call_update" && debugLog) debugLog("update", update);
+      return;
+    }
     const call = hostToolCall(update, this.hostToolNames);
-    if (!call) return;
+    if (!call) {
+      debugLog?.("ignored tool_call", update);
+      return;
+    }
+    debugLog?.("host tool_call", update);
     if (this.seenToolCalls.has(call.id)) return;
     this.seenToolCalls.add(call.id);
     this.pendingToolCalls.push(call);

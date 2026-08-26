@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
+  HOST_TOOL_INSTRUCTIONS,
   promptFor,
   selectedTools,
   type ChatRequest,
@@ -331,8 +332,7 @@ class CodexSession {
         description: tool.description ?? "",
         inputSchema: tool.parameters ?? { type: "object", properties: {} }
       })),
-      baseInstructions:
-        "Produce exactly one assistant turn. Call host functions through the function interface when appropriate; never print a function call as text. Do not inspect files, run commands, browse, or use built-in tools."
+      baseInstructions: HOST_TOOL_INSTRUCTIONS
     }));
     const threadId = record(started.thread).id;
     if (typeof threadId !== "string") throw new Error("Codex returned no thread id");
