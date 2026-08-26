@@ -6,6 +6,7 @@ import {
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
+import { validateImageBase64, type ImageRunner } from "./images.js";
 
 // Stateless subset of the OpenAI Responses API (the Open Responses shape):
 // full `input` on every call, no `previous_response_id`, nothing stored.
@@ -37,7 +38,8 @@ export const responsesRequestSchema = z
     tool_choice: z
       .union([
         z.enum(["auto", "none", "required"]),
-        z.object({ type: z.literal("function"), name: z.string() }).passthrough()
+        z.object({ type: z.literal("function"), name: z.string() }).passthrough(),
+        z.object({ type: z.literal("image_generation") }).strict()
       ])
       .nullish(),
     stream: z.boolean().nullish(),
@@ -73,7 +75,7 @@ export const responsesRequestSchema = z
     prompt_cache_key: z.string().nullish(),
     stream_options: z.record(z.string(), z.unknown()).nullish()
   })
-  .passthrough();
+  .strict();
 
 export type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
 
@@ -102,6 +104,7 @@ function partText(
  * effective value is refused instead of silently dropped.
  */
 function unsupportedControl(input: ResponsesRequest) {
+  if (input.store) return "store: true";
   if (input.max_output_tokens != null) return "max_output_tokens";
   if (input.temperature != null) return "temperature";
   if (input.top_p != null) return "top_p";
@@ -214,6 +217,9 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
     };
   });
   const choice = input.tool_choice ?? "auto";
+  if (typeof choice === "object" && choice.type !== "function") {
+    badRequest("image_generation tool_choice requires an image_generation tool.");
+  }
   const chat = chatRequestSchema.safeParse({
     model: input.model,
     messages,
@@ -303,8 +309,77 @@ function textPart(text: string) {
 export async function respondResponses(
   input: ResponsesRequest,
   runner: ChatRunner,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  imageRunner?: ImageRunner
 ) {
+  const imageTools = (input.tools ?? []).filter((tool) => tool.type === "image_generation");
+  if (imageTools.length) {
+    if (!imageRunner) badRequest("This adapter does not support image_generation.");
+    if (input.stream) badRequest("Streaming image_generation is not supported.");
+    if (imageTools.length !== 1 || input.tools?.length !== 1) {
+      badRequest("image_generation must be the only tool.");
+    }
+    const imageTool = imageTools[0]!;
+    if (Object.keys(imageTool).some((key) => !["type", "partial_images", "size"].includes(key))) {
+      badRequest("Optional image_generation tool parameters are not supported.");
+    }
+    if (imageTool.partial_images != null && imageTool.partial_images !== 0) {
+      badRequest("partial_images greater than 0 is not supported.");
+    }
+    if (
+      imageTool.size != null &&
+      (typeof imageTool.size !== "string" || !/^(?:auto|[1-9]\d*x[1-9]\d*)$/.test(imageTool.size))
+    ) {
+      badRequest("size must be auto or WIDTHxHEIGHT.");
+    }
+    if (input.previous_response_id) {
+      badRequest("previous_response_id is not supported: this bridge is stateless.");
+    }
+    const control = unsupportedControl(input);
+    if (control) badRequest(`This bridge does not support ${control}.`);
+    if (input.tool_choice === "none") {
+      badRequest("tool_choice none cannot be used with the image_generation lane.");
+    }
+    if (
+      input.tool_choice !== "required" &&
+      !(
+        input.tool_choice != null &&
+        typeof input.tool_choice === "object" &&
+        input.tool_choice.type === "image_generation"
+      )
+    ) {
+      badRequest(
+        "image_generation requires tool_choice required or { type: \"image_generation\" }."
+      );
+    }
+    if (typeof input.input !== "string") {
+      badRequest("image_generation currently requires a string input.");
+    }
+    if (input.instructions != null) {
+      badRequest("instructions are not supported in the image_generation lane.");
+    }
+    if (input.reasoning?.effort != null) {
+      badRequest("reasoning.effort is not supported in the image_generation lane.");
+    }
+    const context = {
+      id: itemId("resp"),
+      created: Math.floor(Date.now() / 1000),
+      request: input
+    };
+    const generated = await imageRunner({
+      model: input.model,
+      prompt: input.input,
+      ...(typeof imageTool.size === "string" ? { size: imageTool.size } : {})
+    }, { signal });
+    validateImageBase64(generated.b64Json);
+    return Response.json(responsePayload(context, "completed", [{
+      id: itemId("ig"),
+      type: "image_generation_call",
+      status: "completed",
+      result: generated.b64Json,
+      ...(generated.revisedPrompt ? { revised_prompt: generated.revisedPrompt } : {})
+    }]));
+  }
   const chat = toChatRequest(input);
   const context = {
     id: itemId("resp"),

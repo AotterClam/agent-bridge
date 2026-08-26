@@ -51,6 +51,10 @@ test("selects an adapter and refreshes capabilities", async () => {
 
   const adapters = await client.adapters({ refresh: true });
   expect(adapters[0]?.id).toBe("grok");
+  expect(adapters[0]?.images.generation).toMatchObject({
+    status: "unknown",
+    probe: "legacy-server"
+  });
   expect(requests[1]?.url).toBe(
     "http://127.0.0.1:3457/capabilities?refresh=1"
   );

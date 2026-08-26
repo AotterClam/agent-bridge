@@ -98,6 +98,7 @@ test("rejects controls the adapters cannot honor", () => {
     { frequency_penalty: -0.3 },
     { service_tier: "flex" },
     { reasoning: { summary: "detailed" } },
+    { store: true },
     { stream_options: { include_usage: true } },
     { safety_identifier: "user-42" },
     { prompt_cache_key: "cache-key-9" }
@@ -170,6 +171,7 @@ test("rejects stateful and unsupported requests loudly", () => {
   expect(() =>
     toChatRequest(request({ input: [{ type: "item_reference", id: "x" }] }))
   ).toThrow('input item "item_reference"');
+  expect(() => request({ conversation: "conv_1" })).toThrow();
 });
 
 test("returns a completed response with message and function_call items", async () => {

@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,6 +13,14 @@ import {
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
+import {
+  ownedChild,
+  executableFingerprint,
+  readOwnedImage,
+  validateImageBase64,
+  type ImageCapabilities,
+  type ImageRunner
+} from "./images.js";
 
 const exec = promisify(execFile);
 const REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -126,6 +134,7 @@ export function codexEnvironment(home: string) {
 
 function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMessage) => void) {
   let nextId = 1;
+  let closedError: Error | undefined;
   const pending = new Map<
     number | string,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -149,6 +158,7 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
   });
   return {
     request(method: string, params: unknown) {
+      if (closedError) return Promise.reject(closedError);
       const id = nextId++;
       child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
       return new Promise<unknown>((resolve, reject) => {
@@ -159,8 +169,10 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
       child.stdin.write(`${JSON.stringify({ method, ...(params === undefined ? {} : { params }) })}\n`);
     },
     close(error = new Error("Codex app-server closed")) {
+      closedError ??= error;
+      const failure = closedError;
       lines.close();
-      pending.forEach(({ reject }) => reject(error));
+      pending.forEach(({ reject }) => reject(failure));
       pending.clear();
     }
   };
@@ -177,6 +189,121 @@ function tokenUsage(params: Record<string, unknown>) {
   };
 }
 
+export function imageCapabilitiesFromCodexProbe(
+  imageGeneration: unknown,
+  fingerprint: ImageCapabilities["fingerprint"],
+  error?: string
+): ImageCapabilities {
+  const status =
+    imageGeneration === true
+      ? "supported"
+      : imageGeneration === false
+        ? "unsupported"
+        : "unknown";
+  const capability = {
+    status,
+    probe: "app-server:modelProvider/capabilities/read",
+    evidence: error ?? `imageGeneration=${String(imageGeneration)}`,
+    supported_openai_params: ["n", "response_format"],
+    parameter_constraints: {
+      n: { enum: [1] },
+      response_format: { enum: ["b64_json"] }
+    },
+    provider_capabilities: {
+      runtime: "codex app-server",
+      self_report: { imageGeneration },
+      imagegen_tool: {
+        controllable_parameters: [
+          "prompt",
+          "referenced_image_paths",
+          "num_last_images_to_include"
+        ],
+        backend_defaults: { size: "auto" }
+      }
+    }
+  } as const;
+  return {
+    generation: { ...capability },
+    edit: { ...capability },
+    responsesImageGeneration: {
+      ...capability,
+      supported_openai_params: [],
+      parameter_constraints: {}
+    },
+    fingerprint
+  };
+}
+
+async function probeCodexImageCapabilities(
+  fingerprint: ImageCapabilities["fingerprint"]
+): Promise<ImageCapabilities> {
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-capabilities-"));
+  const isolatedCodexHome = join(cwd, ".codex");
+  let child: ChildProcessWithoutNullStreams | undefined;
+  let client: ReturnType<typeof rpc> | undefined;
+  let stderr = "";
+  const timeout = setTimeout(() => {
+    client?.close(new Error("Codex image capability probe timed out"));
+    child?.kill("SIGTERM");
+  }, 10_000);
+  timeout.unref();
+  try {
+    await mkdir(isolatedCodexHome);
+    const configuredCodexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+    await copyFile(
+      join(configuredCodexHome, "config.toml"),
+      join(isolatedCodexHome, "config.toml")
+    ).catch((error) => {
+      if (record(error).code !== "ENOENT") throw error;
+    });
+    child = spawn(
+      command(),
+      [
+        "--disable", "shell_tool",
+        "--disable", "unified_exec",
+        "--disable", "apps",
+        "--disable", "browser_use",
+        "--disable", "computer_use",
+        "--enable", "image_generation",
+        "--disable", "multi_agent",
+        "app-server",
+        "--stdio"
+      ],
+      {
+        cwd,
+        env: { ...codexEnvironment(cwd), CODEX_HOME: isolatedCodexHome },
+        stdio: ["pipe", "pipe", "pipe"]
+      }
+    );
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    client = rpc(child, () => {});
+    child.once("error", (error) => client?.close(error));
+    child.once("close", (code) => {
+      client?.close(new Error(`Codex capability probe exited ${code}: ${stderr.slice(-1000)}`));
+    });
+    await client.request("initialize", {
+      clientInfo: { name: "agent-bridge", title: "Agent Bridge", version: "0.1.12" },
+      capabilities: { experimentalApi: true, requestAttestation: false }
+    });
+    client.notify("initialized");
+    const result = record(
+      await client.request("modelProvider/capabilities/read", {})
+    );
+    return imageCapabilitiesFromCodexProbe(result.imageGeneration, fingerprint);
+  } catch (error) {
+    return imageCapabilitiesFromCodexProbe(
+      undefined,
+      fingerprint,
+      error instanceof Error ? error.message : "Codex capability probe failed"
+    );
+  } finally {
+    clearTimeout(timeout);
+    client?.close();
+    if (child && !child.killed) child.kill("SIGTERM");
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
+
 export async function detectCodex() {
   const cmd = command();
   let version: string | null = null;
@@ -184,15 +311,24 @@ export async function detectCodex() {
     const { stdout } = await exec(cmd, ["--version"], { timeout: 5_000 });
     version = stdout.trim();
   } catch (error) {
+    const fingerprint = await executableFingerprint(cmd, null);
     return {
       id: "codex" as const,
       name: "Codex",
       available: false,
       version: null,
       error: error instanceof Error ? error.message : "Codex CLI not found.",
-      models: []
+      models: [],
+      images: imageCapabilitiesFromCodexProbe(
+        undefined,
+        fingerprint,
+        "Codex CLI unavailable"
+      )
     };
   }
+
+  const fingerprint = await executableFingerprint(cmd, version);
+  const images = probeCodexImageCapabilities(fingerprint);
 
   try {
     const { stdout } = await exec(cmd, ["debug", "models", "--bundled"], {
@@ -226,7 +362,8 @@ export async function detectCodex() {
       available: models.length > 0,
       version,
       error: models.length ? null : "Codex returned no models.",
-      models
+      models,
+      images: await images
     };
   } catch (error) {
     return {
@@ -235,7 +372,8 @@ export async function detectCodex() {
       available: false,
       version,
       error: error instanceof Error ? error.message : "Codex unavailable.",
-      models: []
+      models: [],
+      images: await images
     };
   }
 }
@@ -486,7 +624,10 @@ class CodexSession {
 }
 
 export async function closeCodexSessions() {
-  await Promise.all([...sessions].map((session) => session.close()));
+  await Promise.all([
+    ...[...sessions].map((session) => session.close()),
+    ...[...imageSessions].map((close) => close())
+  ]);
 }
 
 export const runCodex: ChatRunner = async (input, options = {}) => {
@@ -494,4 +635,190 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
   if (pending) await pending.close();
   const session = await CodexSession.create(input);
   return session.start(input, options);
+};
+
+const imageSessions = new Set<() => Promise<void>>();
+
+export const runCodexImage: ImageRunner = async (input, options = {}) => {
+  if (input.size) {
+    throw Object.assign(new Error("Codex app-server does not expose image size control."), {
+      status: 400
+    });
+  }
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-image-"));
+  const child = spawn(
+    command(),
+    [
+      "--disable", "shell_tool",
+      "--disable", "unified_exec",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "computer_use",
+      "--enable", "image_generation",
+      "--disable", "multi_agent",
+      "app-server",
+      "--stdio"
+    ],
+    { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+  );
+  let stderr = "";
+  let threadDirectory: string | undefined;
+  let removeThreadDirectory = false;
+  let verifiedSavedPath: string | undefined;
+  let settled = false;
+  let timeout: NodeJS.Timeout | undefined;
+  let cleanup: Promise<void> | undefined;
+  let terminalError: Error | undefined;
+  const client = rpc(child, (message) => onMessage(message));
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  let resolveImage!: (result: { b64Json: string; revisedPrompt?: string }) => void;
+  let rejectImage!: (error: Error) => void;
+  const result = new Promise<{ b64Json: string; revisedPrompt?: string }>((resolve, reject) => {
+    resolveImage = resolve;
+    rejectImage = reject;
+  });
+  void result.catch(() => {});
+  let image: Record<string, unknown> | undefined;
+
+  const close = (error = terminalError) => cleanup ??= (async () => {
+    if (timeout) clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+    client.close(error);
+    if (child.exitCode == null && child.signalCode == null) {
+      let closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+      child.kill("SIGTERM");
+      await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      if (child.exitCode == null && child.signalCode == null) {
+        closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        child.kill("SIGKILL");
+        await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      }
+    }
+    await rm(cwd, { recursive: true, force: true });
+    if (removeThreadDirectory && verifiedSavedPath) {
+      await rm(verifiedSavedPath, { force: true });
+    }
+    if (removeThreadDirectory && threadDirectory) {
+      await rmdir(threadDirectory).catch((cause) => {
+        if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(String(record(cause).code))) {
+          throw cause;
+        }
+      });
+    }
+  })();
+
+  const fail = (error: Error) => {
+    if (settled) return;
+    settled = true;
+    terminalError = error;
+    rejectImage(error);
+    void close(error).catch(() => {});
+  };
+  const abort = () => fail(new Error("Codex image generation aborted"));
+  const timeoutMs = codexTurnTimeoutMs();
+  timeout = setTimeout(
+    () => fail(new Error(`Codex image generation timed out after ${timeoutMs} ms.`)),
+    timeoutMs
+  );
+  timeout.unref();
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+
+  function onMessage(message: RpcMessage) {
+    const params = message.params ?? {};
+    if (message.method === "item/completed") {
+      const item = record(params.item);
+      if (item.type === "imageGeneration") {
+        if (image) fail(new Error("Codex returned more than one image"));
+        else image = item;
+      }
+      return;
+    }
+    if (message.method !== "turn/completed") return;
+    const turn = record(params.turn);
+    if (turn.status !== "completed") {
+      fail(new Error(String(record(turn.error).message ?? "Codex image generation failed")));
+      return;
+    }
+    if (!image || typeof image.result !== "string") {
+      fail(new Error("Codex returned no image generation item"));
+      return;
+    }
+    if (image.failure) {
+      fail(new Error(`Codex image generation failed: ${JSON.stringify(image.failure)}`));
+      return;
+    }
+    try {
+      validateImageBase64(image.result);
+      settled = true;
+      resolveImage({
+        b64Json: image.result,
+        ...(typeof image.revisedPrompt === "string"
+          ? { revisedPrompt: image.revisedPrompt }
+          : {})
+      });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error("Codex returned an invalid image"));
+    }
+  }
+
+  imageSessions.add(close);
+  child.on("error", fail);
+  child.on("close", (code) => {
+    if (!settled) fail(new Error(`Codex exited ${code ?? "without a code"}: ${stderr.slice(-1000)}`));
+  });
+
+  try {
+    await client.request("initialize", {
+      clientInfo: { name: "agent-bridge", title: "Agent Bridge", version: "0.1.0" },
+      capabilities: { experimentalApi: true, requestAttestation: false }
+    });
+    client.notify("initialized");
+    const started = record(await client.request("thread/start", {
+      ...(input.model ? { model: input.model } : {}),
+      cwd,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      ephemeral: true,
+      baseInstructions:
+        "Call the built-in image generation tool exactly once, using the user's prompt verbatim. Do not call any other tool."
+    }));
+    const threadId = record(started.thread).id;
+    if (typeof threadId !== "string") throw new Error("Codex returned no thread id");
+    const generatedRoot = join(codexEnvironment(cwd).CODEX_HOME, "generated_images");
+    threadDirectory = ownedChild(generatedRoot, threadId);
+    removeThreadDirectory = !existsSync(threadDirectory);
+    await client.request("turn/start", {
+      threadId,
+      input: [
+        {
+          type: "text",
+          text: input.imagePath
+            ? `Edit the attached image using this prompt verbatim:\n${input.prompt}`
+            : `Generate an image using this prompt verbatim:\n${input.prompt}`,
+          text_elements: []
+        },
+        ...(input.imagePath
+          ? [{ type: "localImage", path: input.imagePath }]
+          : [])
+      ],
+      summary: "concise"
+    });
+    const output = await result;
+    if (typeof image?.savedPath === "string" && threadDirectory) {
+      const saved = await readOwnedImage(image.savedPath, threadDirectory);
+      if (removeThreadDirectory) verifiedSavedPath = image.savedPath;
+      if (!Buffer.from(saved, "base64").equals(Buffer.from(output.b64Json, "base64"))) {
+        throw new Error("Codex image result did not match its saved output");
+      }
+    }
+    return output;
+  } finally {
+    try {
+      await close();
+    } finally {
+      imageSessions.delete(close);
+    }
+  }
 };

@@ -335,13 +335,78 @@ const result = streamText({
 GET  /health
 GET  /capabilities
 GET  /v1/models
+GET  /v1/model/info
+GET  /model/info
 POST /v1/chat/completions
 POST /v1/responses
+POST /v1/images/generations
+POST /v1/images/edits
 ```
 
 Chat completions support standard JSON and SSE streaming responses, OpenAI function-tool calls, and reasoning deltas. The `/v1` routes form the OpenAI-compatible data plane; `/capabilities` uses the separate control token for local discovery.
 
 `/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. Nothing is stored server-side, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
+
+### Images compatibility
+
+Codex and Grok support the OpenAI SDK request/response shape for single-image generation and edits. The bridge accepts `n=1`, `response_format=b64_json`, and one PNG, JPEG, or WebP edit input. It rejects unsupported optional controls instead of silently ignoring them.
+
+| Adapter | Generation `size` | Edit `size` |
+| :--- | :--- | :--- |
+| Codex | Not controllable through the current app-server image tool; its backend uses `auto` | Not controllable; backend uses `auto` |
+| Grok | Maps `WIDTHxHEIGHT` to native `aspect_ratio` (`1:1`, `16:9`, `9:16`, `3:2`, or `2:3`); exact output pixels are provider-selected | Not exposed because Grok ignores `aspect_ratio` for the bridge's single-image edit |
+
+```sh
+curl http://127.0.0.1:3457/v1/images/generations \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"A pearl inside a friendly clam"}'
+
+curl http://127.0.0.1:3457/v1/images/edits \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -F 'image[]=@source.png' \
+  -F 'prompt=Make the pearl blue'
+```
+
+The stateless Responses API also supports the hosted `image_generation` tool on those adapters:
+
+```sh
+curl http://127.0.0.1:3457/v1/responses \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"<MODEL_ID>",
+    "input":"Draw a pearl inside a friendly clam",
+    "tools":[{"type":"image_generation"}],
+    "tool_choice":"required"
+  }'
+```
+
+`/v1/images/*` deliberately has no streaming dialect. `stream: true` and `partial_images > 0` return `400`; partial-image streaming belongs to `/v1/responses` if the local runtimes expose it in the future.
+
+### Host capability detection
+
+`GET /capabilities` probes the CLI executable installed on the user's host. Its real path and version are returned only as a fingerprint; support is determined from the runtime's own capability response or tool catalog, not a version allowlist. Results are cached for the server lifetime; use `GET /capabilities?refresh=1` after changing a CLI installation.
+
+Each image operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. It also exposes LiteLLM's `supported_openai_params` name, strict `parameter_constraints`, and the underlying runtime's unnormalized `provider_capabilities`. Consumers can therefore use the portable OpenAI fields when possible without losing provider-specific controls and caveats.
+
+Codex currently self-reports image support, but its app-server image tool does not expose `size` even though its internal Images client has that field; the bridge reports the host-controllable surface, not a guessed backend maximum. Grok versions without a tool catalog start as `unknown` and are promoted after the first successful live image request. Claude images are unsupported. Antigravity's installed executable schema is reported under `provider_capabilities` (including edit/reference inputs and aspect ratios), while bridge execution remains disabled because the CLI does not offer safe single-tool authorization; the bridge does not enable its unrestricted permission bypass.
+
+`GET /v1/model/info` (and LiteLLM's `/model/info` alias) uses the caller's adapter capability token and returns LiteLLM-shaped `model_name`, `litellm_params`, and `model_info.supported_openai_params`. Bridge-specific operation evidence stays namespaced under `model_info.agent_bridge.images`.
+
+To verify the wire shape with the official OpenAI SDK through an independent conformance runner:
+
+```sh
+docker run --rm \
+  -e OPENAI_BASE_URL=http://host.docker.internal:3457/v1 \
+  -e OPENAI_API_KEY=<CAPABILITY_TOKEN> \
+  -e OPENAI_IMAGE_MODEL=<MODEL_ID> \
+  -e ALLOW_INSECURE_HTTP=true \
+  -e TEST_SUITES=images_generations,images_edits \
+  ghcr.io/beranekio/openai-compatibility-tester:latest
+```
+
+The external runner covers `/v1/images/*`; the repository tests cover the `/v1/responses` `image_generation_call` shape and rejection of unsupported controls.
 
 ---
 

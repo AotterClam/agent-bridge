@@ -8,8 +8,18 @@ import {
   createClaudeRunner,
   discoverClaudeModels
 } from "./claude-bridge.mjs";
-import { closeCodexSessions, detectCodex, runCodex } from "./codex.js";
-import { closeGrokSessions, detectGrok, runGrok } from "./grok.js";
+import {
+  closeCodexSessions,
+  detectCodex,
+  runCodex,
+  runCodexImage
+} from "./codex.js";
+import {
+  closeGrokSessions,
+  detectGrok,
+  runGrok,
+  runGrokImage
+} from "./grok.js";
 import {
   closeAntigravitySessions,
   detectAntigravity,
@@ -23,6 +33,13 @@ import {
   type ChatTurn
 } from "./protocol.js";
 import { respondResponses, responsesRequestSchema } from "./responses.js";
+import {
+  type ImageCapabilities,
+  type ImageCapabilityStatus,
+  imageResponse,
+  parseEditRequest,
+  parseGenerationRequest
+} from "./images.js";
 import { z } from "zod";
 
 export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
@@ -32,6 +49,7 @@ export type AdapterCapability = {
   available: boolean;
   version: string | null;
   error: string | null;
+  images: ImageCapabilities;
   models: Array<{
     id: string;
     name: string;
@@ -43,6 +61,31 @@ export type AgentBridgeAdapter = AdapterCapability & {
   capabilityToken: string;
 };
 
+const imageCapabilitySchema = z.object({
+  status: z.enum(["supported", "unsupported", "unknown"]),
+  probe: z.string(),
+  evidence: z.string(),
+  supported_openai_params: z.array(z.string()).default([]),
+  parameter_constraints: z.record(z.string(), z.unknown()).default({}),
+  provider_capabilities: z.record(z.string(), z.unknown()).default({})
+});
+const legacyUnknownImages = () => {
+  const unknown = {
+    status: "unknown" as const,
+    probe: "legacy-server",
+    evidence: "Image capabilities were not reported by this Agent Bridge server",
+    supported_openai_params: [] as string[],
+    parameter_constraints: {},
+    provider_capabilities: {}
+  };
+  return {
+    generation: { ...unknown },
+    edit: { ...unknown },
+    responsesImageGeneration: { ...unknown },
+    fingerprint: { executable: null, version: null }
+  };
+};
+
 const capabilitiesResponseSchema = z.object({
   adapters: z.array(z.object({
     id: z.enum(["claude", "codex", "grok", "antigravity"]),
@@ -51,6 +94,15 @@ const capabilitiesResponseSchema = z.object({
     version: z.string().nullable(),
     error: z.string().nullable(),
     capabilityToken: z.string().min(1),
+    images: z.object({
+      generation: imageCapabilitySchema,
+      edit: imageCapabilitySchema,
+      responsesImageGeneration: imageCapabilitySchema,
+      fingerprint: z.object({
+        executable: z.string().nullable(),
+        version: z.string().nullable()
+      })
+    }).default(legacyUnknownImages),
     models: z.array(z.object({
       id: z.string(),
       name: z.string(),
@@ -69,6 +121,17 @@ export function capabilityToken(controlToken: string, adapter: AdapterId) {
 }
 
 async function detectClaude(): Promise<AdapterCapability> {
+  const unsupported = {
+    status: "unsupported",
+    probe: "bridge implementation",
+    evidence: "Claude image generation is not implemented",
+    supported_openai_params: [],
+    parameter_constraints: {},
+    provider_capabilities: {
+      runtime: "Claude Agent SDK",
+      image_generation: "not exposed to this bridge"
+    }
+  } as const;
   try {
     const models = await discoverClaudeModels();
     return {
@@ -77,6 +140,12 @@ async function detectClaude(): Promise<AdapterCapability> {
       available: models.length > 0,
       version: null,
       error: models.length ? null : "Claude Agent SDK returned no models.",
+      images: {
+        generation: { ...unsupported },
+        edit: { ...unsupported },
+        responsesImageGeneration: { ...unsupported },
+        fingerprint: { executable: null, version: null }
+      },
       // Unlike Codex, the SDK names no per-model default effort, so
       // `defaultReasoningEffort` stays unset rather than invented.
       models: models.map((model: AdapterCapability["models"][number]) => ({
@@ -95,9 +164,50 @@ async function detectClaude(): Promise<AdapterCapability> {
         error instanceof Error
           ? error.message
           : "Claude Agent SDK unavailable.",
-      models: []
+      models: [],
+      images: {
+        generation: { ...unsupported },
+        edit: { ...unsupported },
+        responsesImageGeneration: { ...unsupported },
+        fingerprint: { executable: null, version: null }
+      }
     };
   }
+}
+
+export function cachedCapabilities(
+  load: () => Promise<AdapterCapability[]>
+) {
+  let current: Promise<AdapterCapability[]> | undefined;
+  return (refresh = false) => {
+    if (refresh) current = undefined;
+    return current ??= load();
+  };
+}
+
+export function allowsImageRunner(
+  adapter: AdapterId,
+  status: ImageCapabilityStatus
+) {
+  return status === "supported" || (adapter === "grok" && status === "unknown");
+}
+
+export function liteLLMModelInfo(adapter: AdapterCapability) {
+  return adapter.models.map((model) => ({
+    model_name: model.id,
+    litellm_params: { model: model.id },
+    model_info: {
+      id: model.id,
+      mode: "chat",
+      supported_openai_params: [
+        "stream",
+        "tools",
+        "tool_choice",
+        ...(model.reasoningEfforts.length ? ["reasoning_effort"] : [])
+      ],
+      agent_bridge: { adapter_id: adapter.id, images: adapter.images }
+    }
+  }));
 }
 
 function json(response: ServerResponse, status: number, payload: unknown) {
@@ -118,7 +228,16 @@ async function body(request: IncomingMessage) {
     }
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw Object.assign(new Error("Request body must be valid JSON."), {
+        status: 400
+      });
+    }
+    throw error;
+  }
 }
 
 async function pipe(source: Response, target: ServerResponse) {
@@ -181,15 +300,23 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     grok: capabilityToken(controlToken, "grok"),
     antigravity: capabilityToken(controlToken, "antigravity")
   };
-  let capabilitiesPromise: Promise<AdapterCapability[]> | undefined;
-  const capabilities = (refresh = false) => {
-    if (refresh) capabilitiesPromise = undefined;
-    return capabilitiesPromise ??= Promise.all([
+  const capabilities = cachedCapabilities(() =>
+    Promise.all([
       detectClaude(),
       detectCodex(),
       detectGrok(),
       detectAntigravity()
-    ]);
+    ])
+  );
+  const markImageSupported = (
+    capability: AdapterCapability | undefined,
+    operation: "generation" | "edit" | "responsesImageGeneration"
+  ) => {
+    const cell = capability?.images[operation];
+    if (!cell || cell.status !== "unknown") return;
+    cell.status = "supported";
+    cell.probe = "live-request";
+    cell.evidence = `${operation} completed successfully on this host`;
   };
   if (options.preloadModels) void capabilities();
   const server = createServer(async (request, response) => {
@@ -247,14 +374,19 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     logInfo.adapter = adapter;
     const isResponses =
       request.method === "POST" && url.pathname === "/v1/responses";
+    const isImageGeneration =
+      request.method === "POST" && url.pathname === "/v1/images/generations";
+    const isImageEdit =
+      request.method === "POST" && url.pathname === "/v1/images/edits";
+    const isImages = isImageGeneration || isImageEdit;
     const runtime =
       adapter === "claude"
-        ? { run: runClaude, ownedBy: "claude-code" }
+        ? { run: runClaude, ownedBy: "claude-code", imageCandidate: undefined }
         : adapter === "grok"
-          ? { run: runGrok, ownedBy: "grok" }
+          ? { run: runGrok, ownedBy: "grok", imageCandidate: runGrokImage }
           : adapter === "antigravity"
-            ? { run: runAntigravity, ownedBy: "google" }
-            : { run: runCodex, ownedBy: "codex" };
+            ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined }
+            : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage };
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -269,16 +401,32 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       });
     }
     if (
+      request.method === "GET" &&
+      (url.pathname === "/v1/model/info" || url.pathname === "/model/info")
+    ) {
+      const status = (await capabilities()).find((item) => item.id === adapter);
+      return json(response, status?.available ? 200 : 503, {
+        data: status ? liteLLMModelInfo(status) : []
+      });
+    }
+    if (
       !isResponses &&
+      !isImages &&
       (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
     ) {
       return json(response, 404, { error: { message: "Not found" } });
     }
+    const mediaType = request.headers["content-type"]?.split(";", 1)[0];
     if (
-      request.headers["content-type"]?.split(";", 1)[0] !== "application/json"
+      (!isImageEdit && mediaType !== "application/json") ||
+      (isImageEdit && mediaType !== "multipart/form-data")
     ) {
       return json(response, 400, {
-        error: { message: "Content-Type must be application/json" }
+        error: {
+          message: isImageEdit
+            ? "Content-Type must be multipart/form-data"
+            : "Content-Type must be application/json"
+        }
       });
     }
     const controller = new AbortController();
@@ -287,6 +435,47 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       if (!response.writableEnded) controller.abort();
     });
     try {
+      if (isImages) {
+        const capability = (await capabilities()).find((item) => item.id === adapter);
+        const operation = isImageEdit ? "edit" : "generation";
+        const image =
+          runtime.imageCandidate &&
+          capability &&
+          capability.images.fingerprint.executable &&
+          allowsImageRunner(adapter, capability.images[operation].status)
+            ? runtime.imageCandidate
+            : undefined;
+        if (!image) {
+          throw Object.assign(
+            new Error(`${adapter} does not support this image operation.`),
+            { status: 400 }
+          );
+        }
+        const parsed = isImageEdit
+          ? await parseEditRequest(request)
+          : await parseGenerationRequest(request);
+        if (
+          parsed.input.size &&
+          !capability!.images[operation].supported_openai_params.includes("size")
+        ) {
+          throw Object.assign(
+            new Error(`${adapter} does not support size for image ${operation}.`),
+            { status: 400 }
+          );
+        }
+        logInfo.model = parsed.input.model;
+        logInfo.imageOperation = isImageEdit ? "edit" : "generation";
+        try {
+          await pipe(
+            imageResponse(await image(parsed.input, { signal: controller.signal })),
+            response
+          );
+          markImageSupported(capability, operation);
+        } finally {
+          await parsed.cleanup();
+        }
+        return;
+      }
       if (isResponses) {
         const parsed = responsesRequestSchema.safeParse(await body(request));
         if (!parsed.success) {
@@ -296,10 +485,47 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         }
         logInfo.model = parsed.data.model;
         logInfo.stream = Boolean(parsed.data.stream);
+        const usesImage = parsed.data.tools?.some(
+          (tool) => tool.type === "image_generation"
+        ) ?? false;
+        const capability = usesImage
+          ? (await capabilities()).find((item) => item.id === adapter)
+          : undefined;
+        const image =
+          usesImage &&
+          runtime.imageCandidate &&
+          capability &&
+          capability.images.fingerprint.executable &&
+          allowsImageRunner(
+            adapter,
+            capability.images.responsesImageGeneration.status
+          )
+            ? runtime.imageCandidate
+            : undefined;
+        const imageTool = parsed.data.tools?.find(
+          (tool) => tool.type === "image_generation"
+        );
+        if (
+          imageTool?.size != null &&
+          !capability?.images.responsesImageGeneration.supported_openai_params.includes("size")
+        ) {
+          throw Object.assign(
+            new Error(`${adapter} does not support size for Responses image_generation.`),
+            { status: 400 }
+          );
+        }
         await pipe(
-          await respondResponses(parsed.data, runtime.run, controller.signal),
+          await respondResponses(
+            parsed.data,
+            runtime.run,
+            controller.signal,
+            image
+          ),
           response
         );
+        if (usesImage) {
+          markImageSupported(capability, "responsesImageGeneration");
+        }
         return;
       }
       const parsed = chatRequestSchema.safeParse(await body(request));

@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,9 +12,63 @@ import {
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
+import {
+  executableFingerprint,
+  type ImageCapabilities
+} from "./images.js";
 
 const exec = promisify(execFile);
 const DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS = 300_000;
+const AGY_IMAGE_ASPECT_RATIOS = [
+  "1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"
+] as const;
+const AGY_IMAGE_SCHEMA_MARKERS = {
+  tool: "generate_image",
+  prompt: "What the image should depict, or how to edit the given images.",
+  image_paths: "Images to edit, combine, or use as references.",
+  image_name: "Short descriptive name for the saved file.",
+  aspect_ratio: "Optional aspect ratio for the generated image. Supported values:"
+} as const;
+
+type AntigravityImageToolProbe = ReturnType<typeof antigravityImageToolFromText>;
+
+export function antigravityImageToolFromText(text: string) {
+  const has = (key: keyof typeof AGY_IMAGE_SCHEMA_MARKERS) =>
+    text.includes(AGY_IMAGE_SCHEMA_MARKERS[key]);
+  return {
+    advertised: has("tool"),
+    parameters: {
+      ...(has("prompt") ? { prompt: { required: true } } : {}),
+      ...(has("image_paths")
+        ? { image_paths: { max_items: 3, uses: ["edit", "combine", "reference"] } }
+        : {}),
+      ...(has("image_name") ? { image_name: { required: true } } : {}),
+      ...(has("aspect_ratio")
+        ? { aspect_ratio: { enum: AGY_IMAGE_ASPECT_RATIOS, default: "1:1" } }
+        : {})
+    }
+  };
+}
+
+async function inspectAntigravityImageTool(executable: string | null) {
+  if (!executable) return null;
+  const found = new Set<keyof typeof AGY_IMAGE_SCHEMA_MARKERS>();
+  const tailLength = Math.max(
+    ...Object.values(AGY_IMAGE_SCHEMA_MARKERS).map((marker) => marker.length)
+  );
+  let tail = "";
+  for await (const chunk of createReadStream(executable)) {
+    const text = tail + Buffer.from(chunk).toString("latin1");
+    for (const [key, marker] of Object.entries(AGY_IMAGE_SCHEMA_MARKERS)) {
+      if (text.includes(marker)) found.add(key as keyof typeof AGY_IMAGE_SCHEMA_MARKERS);
+    }
+    if (found.size === Object.keys(AGY_IMAGE_SCHEMA_MARKERS).length) break;
+    tail = text.slice(-tailLength);
+  }
+  return antigravityImageToolFromText(
+    [...found].map((key) => AGY_IMAGE_SCHEMA_MARKERS[key]).join("\n")
+  );
+}
 
 function command() {
   return resolveCommand(process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND ?? "agy");
@@ -374,11 +428,15 @@ export function resolveAgyModel(
   return requestedModel;
 }
 
-function queryAgy(args: string[], timeoutMs = 5000): Promise<string> {
+function queryAgy(
+  args: string[],
+  timeoutMs = 5000,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const cp = spawn(command(), args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env
+      env
     });
     let stdout = "";
     let stderr = "";
@@ -397,7 +455,7 @@ function queryAgy(args: string[], timeoutMs = 5000): Promise<string> {
     cp.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) {
-        resolve(stdout);
+        resolve(stdout || stderr);
       } else {
         reject(new Error(`Antigravity exited with code ${code}: ${stderr || stdout}`));
       }
@@ -405,7 +463,82 @@ function queryAgy(args: string[], timeoutMs = 5000): Promise<string> {
   });
 }
 
+export function imageCapabilitiesFromAntigravityProbe(
+  imageTool: AntigravityImageToolProbe | null,
+  singleToolAuthorityAdvertised: boolean | null,
+  fingerprint: ImageCapabilities["fingerprint"],
+  error?: string
+): ImageCapabilities {
+  const evidence = error ?? [
+    imageTool?.advertised === true
+      ? "generate_image executable schema found"
+      : imageTool?.advertised === false
+        ? "generate_image executable schema not found"
+        : "generate_image schema unavailable",
+    singleToolAuthorityAdvertised === true
+      ? "single-tool authority advertised; bridge execution not implemented"
+      : "no single-tool authority; bridge execution disabled"
+  ].join("; ");
+  const providerCapabilities = {
+    runtime: "Antigravity CLI",
+    tool: imageTool?.advertised ? "generate_image" : null,
+    parameters: imageTool?.parameters ?? {},
+    execution_authority: { single_tool: singleToolAuthorityAdvertised }
+  };
+  const generation = {
+    status: imageTool ? "unsupported" as const : "unknown" as const,
+    probe: "executable schema + CLI authority",
+    evidence,
+    supported_openai_params: [],
+    parameter_constraints: {},
+    provider_capabilities: providerCapabilities
+  };
+  return {
+    generation: { ...generation },
+    edit: {
+      status: "unsupported",
+      probe: "bridge implementation",
+      evidence: "Antigravity image editing is not implemented",
+      supported_openai_params: [],
+      parameter_constraints: {},
+      provider_capabilities: providerCapabilities
+    },
+    responsesImageGeneration: { ...generation },
+    fingerprint
+  };
+}
+
+async function probeAntigravityImageCapabilities(
+  fingerprint: ImageCapabilities["fingerprint"]
+) {
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-antigravity-capabilities-"));
+  try {
+    const [help, imageTool] = await Promise.all([
+      queryAgy(["--help"], 5_000, antigravityEnvironment(cwd)),
+      inspectAntigravityImageTool(fingerprint.executable)
+    ]);
+    const generateImageAdvertised = /\bgenerate_image\b/.test(help) ? true : null;
+    const singleToolAuthorityAdvertised =
+      /--(?:allow|allowed|enable|enabled)-tools?\b/.test(help) ? true : null;
+    return imageCapabilitiesFromAntigravityProbe(
+      imageTool ?? (generateImageAdvertised ? { advertised: true, parameters: {} } : null),
+      singleToolAuthorityAdvertised,
+      fingerprint
+    );
+  } catch (error) {
+    return imageCapabilitiesFromAntigravityProbe(
+      null,
+      null,
+      fingerprint,
+      error instanceof Error ? error.message : "Antigravity capability probe failed"
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
+
 export async function detectAntigravity() {
+  const cmd = command();
   try {
     const [versionStdout, modelsStdout] = await Promise.all([
       queryAgy(["--version"], 5_000),
@@ -414,6 +547,8 @@ export async function detectAntigravity() {
 
     const version = versionStdout.trim().split("\n")[0] ?? "1.0.0";
     const models = parseAgyModels(modelsStdout);
+    const fingerprint = await executableFingerprint(cmd, version);
+    const images = await probeAntigravityImageCapabilities(fingerprint);
 
     if (models.length === 0) {
       return {
@@ -422,7 +557,8 @@ export async function detectAntigravity() {
         available: false,
         version,
         error: "No authorized models returned by Antigravity CLI",
-        models: []
+        models: [],
+        images
       };
     }
 
@@ -441,16 +577,24 @@ export async function detectAntigravity() {
         ...(m.defaultReasoningEffort
           ? { defaultReasoningEffort: m.defaultReasoningEffort }
           : {})
-      }))
+      })),
+      images
     };
   } catch (error) {
+    const fingerprint = await executableFingerprint(cmd, null);
     return {
       id: "antigravity" as const,
       name: "Antigravity",
       available: false,
       version: null,
       error: error instanceof Error ? error.message : "Antigravity CLI unavailable.",
-      models: []
+      models: [],
+      images: imageCapabilitiesFromAntigravityProbe(
+        null,
+        null,
+        fingerprint,
+        "Antigravity CLI unavailable"
+      )
     };
   }
 }

@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,6 +13,13 @@ import {
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
+import {
+  executableFingerprint,
+  ownedChild,
+  readOwnedImage,
+  type ImageCapabilities,
+  type ImageRunner
+} from "./images.js";
 
 const exec = promisify(execFile);
 const DEFAULT_GROK_TURN_TIMEOUT_MS = 300_000;
@@ -123,12 +130,130 @@ export function modelsFromGrokInitialize(init: unknown) {
   });
 }
 
+export function grokToolCatalogFromInitialize(init: unknown) {
+  const payload = record(init);
+  const meta = record(payload._meta);
+  const capabilities = record(payload.agentCapabilities);
+  const catalogs = [
+    payload.toolCatalog,
+    payload.availableTools,
+    meta.toolCatalog,
+    meta.availableTools,
+    capabilities.toolCatalog,
+    capabilities.availableTools
+  ];
+  for (const catalog of catalogs) {
+    if (!Array.isArray(catalog)) continue;
+    return catalog.flatMap((entry) => {
+      if (typeof entry === "string") return [entry];
+      const tool = record(entry);
+      const name = tool.name ?? tool.toolName ?? tool.id;
+      return typeof name === "string" && name ? [name] : [];
+    });
+  }
+  return null;
+}
+
+const GROK_GENERATION_ASPECT_RATIOS = [
+  "auto", "1:1", "16:9", "9:16", "3:2", "2:3"
+] as const;
+const GROK_EDIT_ASPECT_RATIOS = [
+  "auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+  "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20"
+] as const;
+
+export function grokAspectRatioForSize(size: string) {
+  if (size === "auto") return size;
+  const [width, height] = size.split("x").map(Number);
+  if (!width || !height) throw Object.assign(new Error("size must be auto or WIDTHxHEIGHT."), { status: 400 });
+  const gcd = (a: number, b: number): number => b ? gcd(b, a % b) : a;
+  const divisor = gcd(width, height);
+  const ratio = `${width / divisor}:${height / divisor}`;
+  if (!GROK_GENERATION_ASPECT_RATIOS.includes(ratio as typeof GROK_GENERATION_ASPECT_RATIOS[number])) {
+    throw Object.assign(
+      new Error(`Grok supports these aspect ratios: ${GROK_GENERATION_ASPECT_RATIOS.join(", ")}.`),
+      { status: 400 }
+    );
+  }
+  return ratio;
+}
+
+export function imageCapabilitiesFromGrokCatalog(
+  catalog: string[] | null,
+  fingerprint: ImageCapabilities["fingerprint"],
+  error?: string
+): ImageCapabilities {
+  const capability = (name: "image_gen" | "image_edit") => ({
+    status: catalog === null
+      ? "unknown" as const
+      : catalog.includes(name)
+        ? "supported" as const
+        : "unsupported" as const,
+    probe: "acp:initialize tool catalog",
+    evidence: error ?? (catalog === null
+      ? "ACP initialize returned no built-in tool catalog"
+      : `${name}${catalog.includes(name) ? "" : " not"} advertised`),
+    supported_openai_params: ["n", "response_format"],
+    parameter_constraints: {
+      n: { enum: [1] },
+      response_format: { enum: ["b64_json"] }
+    },
+    provider_capabilities: {
+      runtime: "grok ACP",
+      tool: name,
+      parameters: name === "image_gen"
+        ? { aspect_ratio: { enum: GROK_GENERATION_ASPECT_RATIOS, default: "auto" } }
+        : {
+            aspect_ratio: {
+              enum: GROK_EDIT_ASPECT_RATIOS,
+              default: "auto",
+              ignored_for_single_image: true
+            }
+          }
+    }
+  });
+  const generation = capability("image_gen");
+  return {
+    generation: {
+      ...generation,
+      supported_openai_params: [...generation.supported_openai_params, "size"],
+      parameter_constraints: {
+        ...generation.parameter_constraints,
+        size: {
+          maps_to: "aspect_ratio",
+          exact_pixels: false,
+          supported_aspect_ratios: GROK_GENERATION_ASPECT_RATIOS
+        }
+      }
+    },
+    edit: capability("image_edit"),
+    responsesImageGeneration: {
+      ...generation,
+      supported_openai_params: ["size"],
+      parameter_constraints: {
+        size: {
+          maps_to: "aspect_ratio",
+          exact_pixels: false,
+          supported_aspect_ratios: GROK_GENERATION_ASPECT_RATIOS
+        }
+      }
+    },
+    fingerprint
+  };
+}
+
 async function discoverGrokModelsViaAcp() {
   const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-grok-models-"));
+  const isolatedGrokHome = join(cwd, ".grok");
+  await mkdir(isolatedGrokHome);
   const child = spawn(
     command(),
     ["--no-auto-update", "agent", "--no-leader", "stdio"],
-    { cwd, env: grokEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+    {
+      cwd,
+      env: { ...grokEnvironment(cwd), GROK_HOME: isolatedGrokHome },
+      stdio: ["pipe", "pipe", "pipe"]
+    }
   );
   const client = rpc(child, () => {});
   try {
@@ -143,46 +268,69 @@ async function discoverGrokModelsViaAcp() {
         timer.unref();
       })
     ]);
-    const models = modelsFromGrokInitialize(init);
-    return models.length ? models : null;
+    return {
+      models: modelsFromGrokInitialize(init),
+      toolCatalog: grokToolCatalogFromInitialize(init)
+    };
   } finally {
     client.close();
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     if (!child.killed) child.kill("SIGTERM");
-    setTimeout(() => {
-      if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
-    }, 1_000).unref();
-    void rm(cwd, { recursive: true, force: true });
+    await Promise.race([
+      closed,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 1_000);
+        timer.unref();
+      })
+    ]);
+    if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    await rm(cwd, { recursive: true, force: true });
   }
 }
 
 export async function detectGrok() {
+  const cmd = command();
   try {
-    const [{ stdout: version }, models] = await Promise.all([
-      exec(command(), ["--version"], { timeout: 5_000 }),
+    let acpError: string | undefined;
+    const [{ stdout: version }, acp] = await Promise.all([
+      exec(cmd, ["--version"], { timeout: 5_000 }),
       discoverGrokModelsViaAcp().catch(() => null)
     ]);
+    if (!acp) acpError = "Grok ACP initialize failed";
     const catalog =
-      models ??
+      (acp?.models.length ? acp.models : null) ??
       parseGrokModels(
-        (await exec(command(), ["models"], { timeout: 15_000, maxBuffer: 1024 * 1024 }))
+        (await exec(cmd, ["models"], { timeout: 15_000, maxBuffer: 1024 * 1024 }))
           .stdout
       );
+    const fingerprint = await executableFingerprint(cmd, version.trim());
     return {
       id: "grok" as const,
       name: "Grok Build",
       available: catalog.length > 0,
       version: version.trim(),
       error: catalog.length ? null : "Grok returned no models.",
-      models: catalog
+      models: catalog,
+      images: imageCapabilitiesFromGrokCatalog(
+        acp?.toolCatalog ?? null,
+        fingerprint,
+        acpError
+      )
     };
   } catch (error) {
+    const fingerprint = await executableFingerprint(cmd, null);
     return {
       id: "grok" as const,
       name: "Grok Build",
       available: false,
       version: null,
       error: error instanceof Error ? error.message : "Grok unavailable.",
-      models: []
+      models: [],
+      images: imageCapabilitiesFromGrokCatalog(
+        null,
+        fingerprint,
+        "Grok CLI unavailable"
+      )
     };
   }
 }
@@ -191,6 +339,7 @@ type RunOptions = NonNullable<Parameters<ChatRunner>[1]>;
 
 function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMessage) => void) {
   let nextId = 1;
+  let closedError: Error | undefined;
   const pending = new Map<
     number | string,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -217,6 +366,7 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
   });
   return {
     request(method: string, params: unknown) {
+      if (closedError) return Promise.reject(closedError);
       const id = nextId++;
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`
@@ -234,8 +384,10 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
     },
     close(error = new Error("Grok agent closed")) {
+      closedError ??= error;
+      const failure = closedError;
       lines.close();
-      pending.forEach(({ reject }) => reject(error));
+      pending.forEach(({ reject }) => reject(failure));
       pending.clear();
     }
   };
@@ -683,7 +835,10 @@ class GrokSession {
 }
 
 export async function closeGrokSessions() {
-  await Promise.all([...sessions].map((session) => session.close()));
+  await Promise.all([
+    ...[...sessions].map((session) => session.close()),
+    ...[...grokImageSessions].map((close) => close())
+  ]);
 }
 
 export const runGrok: ChatRunner = async (input, options = {}) => {
@@ -698,4 +853,214 @@ export const runGrok: ChatRunner = async (input, options = {}) => {
   }
   const session = await GrokSession.create(input);
   return session.prompt(input, options);
+};
+
+const grokImageSessions = new Set<() => Promise<void>>();
+
+function grokToolName(value: unknown) {
+  const tool = record(value);
+  const meta = record(record(tool._meta)["x.ai/tool"]);
+  return String(meta.name ?? tool.toolName ?? tool.title ?? "");
+}
+
+export const runGrokImage: ImageRunner = async (input, options = {}) => {
+  if (input.imagePath && input.size) {
+    throw Object.assign(new Error("Grok ignores aspect_ratio for single-image edits."), {
+      status: 400
+    });
+  }
+  const cwd = await realpath(
+    await mkdtemp(join(tmpdir(), "agent-bridge-grok-image-"))
+  );
+  const sessionBucket = ownedChild(
+    join(grokHomePath(), "sessions"),
+    encodeURIComponent(cwd)
+  );
+  const expectedTool = input.imagePath ? "image_edit" : "image_gen";
+  const args = [
+    "--no-auto-update",
+    "--disable-web-search",
+    "agent",
+    "--no-leader",
+    ...(input.model ? ["--model", input.model] : []),
+    "stdio"
+  ];
+  const child = spawn(
+    command(),
+    args,
+    { cwd, env: grokEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+  );
+  let stderr = "";
+  let settled = false;
+  let sessionId: string | undefined;
+  let sessionDirectory: string | undefined;
+  let imageCallId: string | undefined;
+  let permissionGranted = false;
+  let timeout: NodeJS.Timeout | undefined;
+  let cleanup: Promise<void> | undefined;
+  let terminalError: Error | undefined;
+  const client = rpc(child, (message) => onMessage(message));
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  let resolveImage!: (result: { b64Json: string }) => void;
+  let rejectImage!: (error: Error) => void;
+  const result = new Promise<{ b64Json: string }>((resolve, reject) => {
+    resolveImage = resolve;
+    rejectImage = reject;
+  });
+  void result.catch(() => {});
+
+  const close = (error = terminalError) => cleanup ??= (async () => {
+    if (timeout) clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+    client.close(error);
+    if (child.exitCode == null && child.signalCode == null) {
+      let closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+      child.kill("SIGTERM");
+      await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      if (child.exitCode == null && child.signalCode == null) {
+        closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        child.kill("SIGKILL");
+        await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      }
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(sessionBucket, { recursive: true, force: true });
+  })();
+
+  const fail = (error: Error) => {
+    if (settled) return;
+    settled = true;
+    terminalError = error;
+    rejectImage(error);
+    void close(error).catch(() => {});
+  };
+  const abort = () => fail(new Error("Grok image generation aborted"));
+  const timeoutMs = grokTurnTimeoutMs();
+  timeout = setTimeout(
+    () => fail(new Error(`Grok image generation timed out after ${timeoutMs} ms.`)),
+    timeoutMs
+  );
+  timeout.unref();
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+
+  async function complete(path: string) {
+    if (!sessionDirectory) {
+      return fail(new Error("Grok returned an image before its session id"));
+    }
+    const root = ownedChild(sessionDirectory, "images");
+    try {
+      const b64Json = await readOwnedImage(path, root);
+      if (settled) return;
+      settled = true;
+      resolveImage({ b64Json });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error("Grok returned an invalid image"));
+    }
+  }
+
+  function onMessage(message: RpcMessage) {
+    if (message.method === "session/request_permission" && message.id != null) {
+      const params = message.params ?? {};
+      const toolCall = record(params.toolCall);
+      const allowed =
+        grokToolName(toolCall) === expectedTool && !permissionGranted;
+      const choices = Array.isArray(params.options) ? params.options.map(record) : [];
+      const option = choices.find((choice) =>
+        String(choice.kind ?? choice.optionId).includes(allowed ? "allow_once" : "reject")
+      );
+      client.respond(message.id, {
+        outcome: {
+          outcome: "selected",
+          optionId: option?.optionId ?? (allowed ? "allow-once" : "reject-once")
+        }
+      });
+      if (allowed) permissionGranted = true;
+      else fail(new Error(`Grok attempted unsupported or repeated tool "${grokToolName(toolCall)}"`));
+      return;
+    }
+    if (message.method !== "session/update") return;
+    const update = record(record(message.params).update);
+    if (update.sessionUpdate === "tool_call") {
+      if (grokToolName(update) !== expectedTool || imageCallId) {
+        fail(new Error(`Grok attempted unsupported or repeated tool "${grokToolName(update)}"`));
+        return;
+      }
+      imageCallId = String(update.toolCallId ?? "");
+      return;
+    }
+    if (update.sessionUpdate !== "tool_call_update") return;
+    if (!imageCallId || update.toolCallId !== imageCallId) return;
+    const status = String(update.status).toLowerCase();
+    if (["failed", "cancelled", "canceled"].includes(status)) {
+      const output = record(update.rawOutput);
+      fail(new Error(String(output.message ?? output.error ?? `Grok image tool ${status}`)));
+      return;
+    }
+    if (status !== "completed") return;
+    const output = record(update.rawOutput);
+    if (typeof output.path !== "string") {
+      fail(new Error("Grok image tool returned no output path"));
+      return;
+    }
+    void complete(output.path);
+  }
+
+  grokImageSessions.add(close);
+  child.on("error", fail);
+  child.on("close", (code) => {
+    if (!settled) fail(new Error(`Grok exited ${code ?? "without a code"}: ${stderr.slice(-1000)}`));
+  });
+
+  try {
+    const init = record(await client.request("initialize", {
+      protocolVersion: 1,
+      clientInfo: { name: "agent-bridge", version: "0.1.12" },
+      clientCapabilities: {}
+    }));
+    const methods = new Set(
+      (Array.isArray(init.authMethods) ? init.authMethods : [])
+        .map((method) => String(record(method).id))
+        .filter(Boolean)
+    );
+    const methodId =
+      process.env.XAI_API_KEY && methods.has("xai.api_key")
+        ? "xai.api_key"
+        : methods.has("cached_token")
+          ? "cached_token"
+          : null;
+    if (!methodId) throw new Error("Run `grok login` first, or set XAI_API_KEY.");
+    await client.request("authenticate", { methodId, _meta: { headless: true } });
+    const started = record(await client.request("session/new", {
+      cwd,
+      mcpServers: [],
+      _meta: {
+        yoloMode: false,
+        systemPromptOverride:
+          `Call ${expectedTool} exactly once. Do not call any other tool and do not alter the user's prompt.`
+      }
+    }));
+    if (typeof started.sessionId !== "string") throw new Error("Grok returned no session id");
+    sessionId = started.sessionId;
+    sessionDirectory = ownedChild(sessionBucket, sessionId);
+    void client.request("session/prompt", {
+      sessionId,
+      prompt: [{
+        type: "text",
+        text: input.imagePath
+          ? `Call image_edit with prompt ${JSON.stringify(input.prompt)} and image ${JSON.stringify(input.imagePath)}.`
+          : `Call image_gen with prompt ${JSON.stringify(input.prompt)}${input.size
+              ? ` and aspect_ratio ${JSON.stringify(grokAspectRatioForSize(input.size))}`
+              : ""}.`
+      }]
+    }).catch((error) => fail(error instanceof Error ? error : new Error("Grok image generation failed")));
+    return await result;
+  } finally {
+    try {
+      await close();
+    } finally {
+      grokImageSessions.delete(close);
+    }
+  }
 };
