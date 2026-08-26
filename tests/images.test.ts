@@ -15,6 +15,7 @@ import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { closeCodexSessions, runCodexImage } from "../src/codex.js";
+import { createFileStore } from "../src/files.js";
 import {
   closeGrokSessions,
   grokAspectRatioForSize,
@@ -42,13 +43,22 @@ function incoming(
 }
 
 test("parses the strict generation and edit subset", async () => {
+  const store = createFileStore();
   const generated = await parseGenerationRequest(incoming(
     Buffer.from(JSON.stringify({ model: "test", prompt: "draw it", n: 1 })),
     "application/json"
   ));
   expect(generated.input).toEqual({ model: "test", prompt: "draw it" });
   expect((await parseGenerationRequest(incoming(
-    Buffer.from(JSON.stringify({ prompt: "draw it" })),
+    Buffer.from(JSON.stringify({
+      prompt: "draw it",
+      model: null,
+      n: null,
+      stream: null,
+      partial_images: null,
+      response_format: null,
+      size: null
+    })),
     "application/json"
   ))).input).toEqual({ prompt: "draw it" });
   expect(() => imageResponse({ b64Json: "not-base64" })).toThrow("invalid base64");
@@ -72,17 +82,19 @@ test("parses the strict generation and edit subset", async () => {
 
   const form = new FormData();
   form.set("prompt", "make it blue");
-  form.set("image[]", new File([png], "source.png", { type: "image/png" }));
+  form.append("image", new File([png], "source.png", { type: "image/png" }));
+  form.append("image[]", new File([png], "reference.png", { type: "image/png" }));
   const encoded = new Response(form);
   const contentType = encoded.headers.get("content-type")!;
   const edited = await parseEditRequest(incoming(
     Buffer.from(await encoded.arrayBuffer()),
     contentType
-  ));
+  ), store, "codex");
   expect(edited.input).toMatchObject({ prompt: "make it blue" });
   expect(edited.input.model).toBeUndefined();
-  expect(await readFile(edited.input.imagePath!)).toEqual(png);
-  const directory = dirname(edited.input.imagePath!);
+  expect(edited.input.imagePaths).toHaveLength(2);
+  expect(await Promise.all(edited.input.imagePaths!.map((path) => readFile(path)))).toEqual([png, png]);
+  const directory = dirname(edited.input.imagePaths![0]!);
   await edited.cleanup();
   await expect(lstat(directory)).rejects.toThrow();
 
@@ -90,7 +102,72 @@ test("parses the strict generation and edit subset", async () => {
     Buffer.from("too large"),
     contentType,
     { "content-length": String(53 * 1024 * 1024) }
-  ))).rejects.toMatchObject({ status: 413 });
+  ), store, "codex")).rejects.toMatchObject({ status: 413 });
+  await store.close();
+});
+
+test("resolves JSON edit file_id and data URL images with strict one-of", async () => {
+  const store = createFileStore();
+  const upload = new FormData();
+  upload.set("purpose", "vision");
+  upload.set("file", new File([png], "stored.png", { type: "image/png" }));
+  const encoded = new Response(upload);
+  const contentType = encoded.headers.get("content-type")!;
+  try {
+    const file = await store.upload(incoming(
+      Buffer.from(await encoded.arrayBuffer()),
+      contentType
+    ), "codex");
+    const edit = await parseEditRequest(incoming(Buffer.from(JSON.stringify({
+      prompt: "combine them",
+      model: null,
+      n: null,
+      stream: null,
+      partial_images: null,
+      response_format: null,
+      size: null,
+      images: [
+        { file_id: file.id },
+        { image_url: `data:image/png;base64,${png64}` }
+      ]
+    })), "application/json"), store, "codex");
+    expect(edit.input.imagePaths).toHaveLength(2);
+    expect(await Promise.all(edit.input.imagePaths!.map((path) => readFile(path)))).toEqual([png, png]);
+    await edit.cleanup();
+
+    for (const image of [
+      {},
+      { file_id: file.id, image_url: `data:image/png;base64,${png64}` }
+    ]) {
+      await expect(parseEditRequest(incoming(Buffer.from(JSON.stringify({
+        prompt: "invalid",
+        images: [image]
+      })), "application/json"), store, "codex")).rejects.toMatchObject({ status: 400 });
+    }
+
+    await expect(parseEditRequest(incoming(Buffer.from(JSON.stringify({
+      prompt: "remote",
+      images: [{ image_url: "https://example.com/source.png" }]
+    })), "application/json"), store, "codex")).rejects.toMatchObject({ status: 400 });
+
+    const sixteen = await parseEditRequest(incoming(Buffer.from(JSON.stringify({
+      prompt: "sixteen",
+      images: Array.from({ length: 16 }, () => ({
+        image_url: `data:image/png;base64,${png64}`
+      }))
+    })), "application/json"), store, "codex");
+    expect(sixteen.input.imagePaths).toHaveLength(16);
+    await sixteen.cleanup();
+
+    await expect(parseEditRequest(incoming(Buffer.from(JSON.stringify({
+      prompt: "seventeen",
+      images: Array.from({ length: 17 }, () => ({
+        image_url: `data:image/png;base64,${png64}`
+      }))
+    })), "application/json"), store, "codex")).rejects.toMatchObject({ status: 400 });
+  } finally {
+    await store.close();
+  }
 });
 
 test("returns a Responses image_generation_call and validates image controls", async () => {
@@ -186,6 +263,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "initialize") send({ id: message.id, result: {} });
   else if (message.method === "thread/start") send({ id: message.id, result: { thread: { id: "thread-image" } } });
   else if (message.method === "turn/start") {
+    const text = message.params.input.find((item) => item.type === "text")?.text ?? "";
+    const images = message.params.input.filter((item) => item.type === "localImage");
+    if (text.includes("combine") && images.length !== 2) {
+      send({ id: message.id, result: { turn: { id: "turn-image" } } });
+      send({ method: "turn/completed", params: { turn: {
+        status: "failed", error: { message: "expected two local images" }
+      } } });
+      return;
+    }
     const root = join(process.env.CODEX_HOME, "generated_images", "thread-image");
     const path = join(root, "output.png");
     mkdirSync(root, { recursive: true });
@@ -205,7 +291,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   try {
     expect(await runCodexImage({ prompt: "draw" })).toEqual({ b64Json: png64 });
     await expect(lstat(join(codexHome, "generated_images", "thread-image"))).rejects.toThrow();
-    expect(await runCodexImage({ model: "test", prompt: "blue", imagePath: source }))
+    expect(await runCodexImage({ model: "test", prompt: "blue", imagePaths: [source] }))
+      .toEqual({ b64Json: png64 });
+    expect(await runCodexImage({ prompt: "combine", imagePaths: [source, source] }))
       .toEqual({ b64Json: png64 });
     await expect(runCodexImage({ prompt: "wide", size: "1600x900" }))
       .rejects.toThrow("does not expose image size");
@@ -288,9 +376,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   process.env.TMPDIR = tempAlias;
   try {
     expect(await runGrokImage({ prompt: "draw" })).toEqual({ b64Json: png64 });
-    expect(await runGrokImage({ model: "test", prompt: "blue", imagePath: source }))
+    expect(await runGrokImage({ model: "test", prompt: "blue", imagePaths: [source] }))
       .toEqual({ b64Json: png64 });
-    await expect(runGrokImage({ prompt: "crop", imagePath: source, size: "1600x900" }))
+    await expect(runGrokImage({ prompt: "combine", imagePaths: [source, source] }))
+      .rejects.toThrow("at most one");
+    await expect(runGrokImage({ prompt: "crop", imagePaths: [source], size: "1600x900" }))
       .rejects.toThrow("ignores aspect_ratio");
     expect(await runGrokImage({ model: "ratio", prompt: "wide", size: "1600x900" }))
       .toEqual({ b64Json: png64 });

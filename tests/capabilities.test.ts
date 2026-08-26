@@ -26,6 +26,20 @@ test("maps host self-report and tool catalog evidence without version guessing",
   expect(codex.edit.status).toBe("supported");
   expect(codex.fingerprint).toEqual(fingerprint);
   expect(codex.generation.supported_openai_params).not.toContain("size");
+  expect(codex.edit.parameter_constraints.images).toEqual({
+    min_items: 1,
+    max_items: 16,
+    schema_max_items: 16,
+    max_items_source: "openai_schema",
+    runtime_max_items: null,
+    max_image_bytes: 50 * 1024 * 1024,
+    max_total_request_bytes: 52 * 1024 * 1024,
+    multipart_fields: ["image", "image[]"],
+    json_refs: {
+      file_id: true,
+      image_url: { schemes: ["data"], max_chars: 20_971_520 }
+    }
+  });
   expect(codex.generation.provider_capabilities).toMatchObject({
     self_report: { imageGeneration: true },
     imagegen_tool: { backend_defaults: { size: "auto" } }
@@ -41,6 +55,20 @@ test("maps host self-report and tool catalog evidence without version guessing",
   expect(grok.edit.status).toBe("supported");
   expect(grok.generation.supported_openai_params).toContain("size");
   expect(grok.edit.supported_openai_params).not.toContain("size");
+  expect(grok.edit.parameter_constraints.images).toEqual({
+    min_items: 1,
+    max_items: 1,
+    schema_max_items: 16,
+    max_items_source: "bridge_adapter",
+    runtime_max_items: 1,
+    max_image_bytes: 50 * 1024 * 1024,
+    max_total_request_bytes: 52 * 1024 * 1024,
+    multipart_fields: ["image", "image[]"],
+    json_refs: {
+      file_id: true,
+      image_url: { schemes: ["data"], max_chars: 20_971_520 }
+    }
+  });
   expect(grok.generation.provider_capabilities).toMatchObject({
     tool: "image_gen",
     parameters: { aspect_ratio: { default: "auto" } }

@@ -16,6 +16,10 @@ import {
 import {
   ownedChild,
   executableFingerprint,
+  MAX_EDIT_IMAGES,
+  MAX_IMAGE_BODY,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_URL_CHARS,
   readOwnedImage,
   validateImageBase64,
   type ImageCapabilities,
@@ -230,7 +234,29 @@ export function imageCapabilitiesFromCodexProbe(
   } as const;
   return {
     generation: { ...capability },
-    edit: { ...capability },
+    edit: {
+      ...capability,
+      parameter_constraints: {
+        ...capability.parameter_constraints,
+        images: {
+          min_items: 1,
+          max_items: MAX_EDIT_IMAGES,
+          schema_max_items: MAX_EDIT_IMAGES,
+          max_items_source: "openai_schema",
+          runtime_max_items: null,
+          max_image_bytes: MAX_IMAGE_BYTES,
+          max_total_request_bytes: MAX_IMAGE_BODY,
+          multipart_fields: ["image", "image[]"],
+          json_refs: {
+            file_id: true,
+            image_url: {
+              schemes: ["data"],
+              max_chars: MAX_IMAGE_URL_CHARS
+            }
+          }
+        }
+      }
+    },
     responsesImageGeneration: {
       ...capability,
       supported_openai_params: [],
@@ -889,14 +915,12 @@ export const runCodexImage: ImageRunner = async (input, options = {}) => {
       input: [
         {
           type: "text",
-          text: input.imagePath
+          text: input.imagePaths?.length
             ? `Edit the attached image using this prompt verbatim:\n${input.prompt}`
             : `Generate an image using this prompt verbatim:\n${input.prompt}`,
           text_elements: []
         },
-        ...(input.imagePath
-          ? [{ type: "localImage", path: input.imagePath }]
-          : [])
+        ...(input.imagePaths ?? []).map((path) => ({ type: "localImage", path }))
       ],
       summary: "concise"
     });

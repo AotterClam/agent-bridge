@@ -15,7 +15,7 @@ export const fileStorageCapability = {
   persistence: "Files are deleted when the bridge closes",
   max_file_bytes: MAX_INPUT_BYTES,
   accepted_media_types: ["*/*"],
-  resolves_file_id_for: ["input_image", "input_file", "chat.file"],
+  resolves_file_id_for: ["input_image", "input_file", "chat.file", "images.edit"],
   endpoints: [
     "POST /v1/files",
     "GET /v1/files",

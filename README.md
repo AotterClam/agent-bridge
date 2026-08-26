@@ -400,7 +400,9 @@ curl http://127.0.0.1:3457/v1/responses \
 
 ### Images compatibility
 
-Codex and Grok support the OpenAI SDK request/response shape for single-image generation and edits. The bridge accepts `n=1`, `response_format=b64_json`, and one PNG, JPEG, or WebP edit input. It rejects unsupported optional controls instead of silently ignoring them.
+Codex and Grok expose the wire shape documented by OpenAI for [image generation](https://developers.openai.com/api/reference/resources/images/methods/generate) and [image edits](https://developers.openai.com/api/reference/resources/images/methods/edit). The bridge accepts `n=1`, `response_format=b64_json`, and PNG, JPEG, or WebP edit inputs. Multipart edits accept repeated `image` and `image[]` fields used by official SDK clients; JSON edits accept the official `images: [{file_id|image_url}]` references. `file_id` resolves through the caller's private bridge FileStore, and `image_url` currently accepts base64 data URLs. Remote HTTP(S) `image_url` values and edit masks are not yet supported and return `400` instead of being ignored.
+
+The Codex wire parser accepts the OpenAI schema limit of 16 edit inputs and passes every one to the app-server as a local image. Codex does not report a provider-side reference limit, so `/capabilities` keeps `runtime_max_items` unknown instead of claiming that 16-image execution was host-verified. Grok's installed `image_edit` tool accepts one input and reports `runtime_max_items: 1`, so Grok returns `400` for a multi-image edit instead of reducing the request to the lowest common denominator. The current parser caps the complete edit request at 52 MiB; this and the 50 MiB per-image limit are reported in `parameter_constraints`. Unsupported optional controls are rejected rather than silently ignored.
 
 | Adapter | Generation `size` | Edit `size` |
 | :--- | :--- | :--- |
@@ -415,8 +417,14 @@ curl http://127.0.0.1:3457/v1/images/generations \
 
 curl http://127.0.0.1:3457/v1/images/edits \
   -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
-  -F 'image[]=@source.png' \
+  -F 'image=@source.png' \
+  -F 'image[]=@reference.png' \
   -F 'prompt=Make the pearl blue'
+
+curl http://127.0.0.1:3457/v1/images/edits \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"Combine the references\",\"images\":[{\"file_id\":\"$FILE_ID\"},{\"image_url\":\"data:image/png;base64,<BASE64>\"}]}"
 ```
 
 The stateless Responses API also supports the hosted `image_generation` tool on those adapters:
@@ -433,7 +441,7 @@ curl http://127.0.0.1:3457/v1/responses \
   }'
 ```
 
-`/v1/images/*` deliberately has no streaming dialect. `stream: true` and `partial_images > 0` return `400`; partial-image streaming belongs to `/v1/responses` if the local runtimes expose it in the future.
+Images streaming is part of the official OpenAI schema, but the local runtimes currently expose only terminal images. `/v1/images/*` therefore recognizes those official controls while returning `400` for `stream: true` and `partial_images > 0`. The bridge never emits a custom streaming dialect; exact official Images or Responses SSE can be added when a runtime exposes real partial frames.
 
 ### Host capability detection
 

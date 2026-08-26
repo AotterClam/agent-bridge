@@ -4,26 +4,54 @@ import { access, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
+import type { FileStore } from "./files.js";
+import { decodeImageDataUrl } from "./inputs.js";
 
-const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
-const MAX_IMAGE_BODY = 52 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+export const MAX_IMAGE_BODY = 52 * 1024 * 1024;
+export const MAX_EDIT_IMAGES = 16;
+export const MAX_IMAGE_URL_CHARS = 20_971_520;
 const imageSizeSchema = z.string().regex(/^(?:auto|[1-9]\d*x[1-9]\d*)$/);
 const generationSchema = z
   .object({
-    model: z.string().min(1).optional(),
+    model: z.string().min(1).nullish(),
     prompt: z.string().min(1),
-    n: z.literal(1).optional(),
-    stream: z.literal(false).optional(),
-    partial_images: z.literal(0).optional(),
-    response_format: z.literal("b64_json").optional(),
-    size: imageSizeSchema.optional()
+    n: z.literal(1).nullish(),
+    stream: z.literal(false).nullish(),
+    partial_images: z.literal(0).nullish(),
+    response_format: z.literal("b64_json").nullish(),
+    size: imageSizeSchema.nullish()
+  })
+  .strict();
+const editControls = {
+  model: z.string().min(1).nullish(),
+  prompt: z.string().min(1),
+  n: z.literal(1).nullish(),
+  stream: z.literal(false).nullish(),
+  partial_images: z.literal(0).nullish(),
+  response_format: z.literal("b64_json").nullish(),
+  size: imageSizeSchema.nullish()
+};
+const editJsonSchema = z
+  .object({
+    ...editControls,
+    images: z.array(z
+      .object({
+        file_id: z.string().min(1).optional(),
+        image_url: z.string().min(1).max(MAX_IMAGE_URL_CHARS).optional()
+      })
+      .strict()
+      .refine(
+        (image) => Number(Boolean(image.file_id)) + Number(Boolean(image.image_url)) === 1,
+        { message: "Each image must use exactly one of file_id or image_url." }
+      )).min(1).max(MAX_EDIT_IMAGES)
   })
   .strict();
 
 export type ImageRequest = {
   model?: string;
   prompt: string;
-  imagePath?: string;
+  imagePaths?: string[];
   size?: string;
 };
 
@@ -36,6 +64,10 @@ export type ImageRunner = (
   input: ImageRequest,
   options?: { signal?: AbortSignal }
 ) => Promise<ImageResult>;
+type ParsedImageRequest = {
+  input: ImageRequest;
+  cleanup: () => Promise<void>;
+};
 
 export type ImageCapabilityStatus = "supported" | "unsupported" | "unknown";
 export type ImageCapability = {
@@ -141,7 +173,9 @@ export async function readOwnedImage(path: string, root: string) {
   }
 }
 
-export async function parseGenerationRequest(request: IncomingMessage) {
+export async function parseGenerationRequest(
+  request: IncomingMessage
+): Promise<ParsedImageRequest> {
   let payload: unknown;
   try {
     payload = JSON.parse((await bytes(request)).toString("utf8"));
@@ -161,10 +195,75 @@ export async function parseGenerationRequest(request: IncomingMessage) {
   };
 }
 
-export async function parseEditRequest(request: IncomingMessage) {
+function validateInputImage(data: Buffer) {
+  if (data.byteLength > MAX_IMAGE_BYTES) {
+    throw Object.assign(new Error("Image upload exceeds 50 MiB"), { status: 413 });
+  }
+  try {
+    return imageExtension(data);
+  } catch {
+    badRequest("Only PNG, JPEG, and WebP images are supported.");
+  }
+}
+
+async function materializeEditImages(
+  images: Buffer[],
+  controls: {
+    model?: string | null;
+    prompt: string;
+    size?: string | null;
+  }
+) {
+  const extensions = images.map(validateInputImage);
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-image-"));
+  const imagePaths = extensions.map((extension, index) =>
+    join(directory, `input-${index}${extension}`)
+  );
+  try {
+    await Promise.all(imagePaths.map((path, index) =>
+      writeFile(path, images[index]!, { flag: "wx", mode: 0o600 })
+    ));
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    input: {
+      ...(controls.model ? { model: controls.model } : {}),
+      prompt: controls.prompt,
+      imagePaths,
+      ...(controls.size ? { size: controls.size } : {})
+    } satisfies ImageRequest,
+    cleanup: () => rm(directory, { recursive: true, force: true })
+  };
+}
+
+export async function parseEditRequest(
+  request: IncomingMessage,
+  store: FileStore,
+  owner: string
+): Promise<ParsedImageRequest> {
   const contentType = request.headers["content-type"] ?? "";
-  let form: FormData;
   const data = await bytes(request);
+  if (/^application\/json(?:;|$)/i.test(contentType)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data.toString("utf8"));
+    } catch {
+      badRequest("Request body must be valid JSON.");
+    }
+    const parsed = editJsonSchema.safeParse(payload);
+    if (!parsed.success) badRequest(z.prettifyError(parsed.error));
+    const images = await Promise.all(parsed.data.images.map(async (image) => {
+      if (image.file_id) return (await store.read(owner, image.file_id)).data;
+      return decodeImageDataUrl(image.image_url!, MAX_IMAGE_BYTES).bytes;
+    }));
+    return materializeEditImages(images, parsed.data);
+  }
+  if (!/^multipart\/form-data(?:;|$)/i.test(contentType)) {
+    badRequest("Content-Type must be application/json or multipart/form-data.");
+  }
+  let form: FormData;
   try {
     form = await new Response(data, {
       headers: { "content-type": contentType }
@@ -205,38 +304,27 @@ export async function parseEditRequest(request: IncomingMessage) {
     const value = form.get(key);
     if (value != null && value !== expected) badRequest(`Unsupported ${key}: ${String(value)}.`);
   }
-  const images = [...form.getAll("image"), ...form.getAll("image[]")];
-  if (images.length !== 1 || typeof images[0] === "string") {
-    badRequest("Exactly one image upload is required.");
+  const images: Array<string | File> = [];
+  for (const [key, value] of form.entries()) {
+    if (key === "image" || key === "image[]") images.push(value);
   }
-  const upload = images[0] as File;
-  const imageData = Buffer.from(await upload.arrayBuffer());
-  if (imageData.byteLength > MAX_IMAGE_BYTES) {
-    throw Object.assign(new Error("Image upload exceeds 50 MiB"), { status: 413 });
+  if (
+    images.length < 1 ||
+    images.length > MAX_EDIT_IMAGES ||
+    !images.every((image): image is File => image instanceof File)
+  ) {
+    badRequest(`Between 1 and ${MAX_EDIT_IMAGES} image uploads are required.`);
   }
-  let extension: string;
-  try {
-    extension = imageExtension(imageData);
-  } catch {
-    badRequest("Only PNG, JPEG, and WebP images are supported.");
-  }
-  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-image-"));
-  const imagePath = join(directory, `input${extension}`);
-  try {
-    await writeFile(imagePath, imageData, { flag: "wx" });
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
-  }
-  return {
-    input: {
+  return materializeEditImages(
+    await Promise.all(images.map(async (image) =>
+      Buffer.from(await image.arrayBuffer())
+    )),
+    {
       ...(typeof model === "string" ? { model } : {}),
       prompt,
-      imagePath,
       ...(typeof size === "string" ? { size } : {})
-    } satisfies ImageRequest,
-    cleanup: () => rm(directory, { recursive: true, force: true })
-  };
+    }
+  );
 }
 
 export function imageResponse(result: ImageResult) {

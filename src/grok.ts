@@ -16,6 +16,10 @@ import {
 } from "./protocol.js";
 import {
   executableFingerprint,
+  MAX_EDIT_IMAGES,
+  MAX_IMAGE_BODY,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_URL_CHARS,
   ownedChild,
   readOwnedImage,
   type ImageCapabilities,
@@ -220,6 +224,7 @@ export function imageCapabilitiesFromGrokCatalog(
     }
   });
   const generation = capability("image_gen");
+  const edit = capability("image_edit");
   return {
     generation: {
       ...generation,
@@ -233,7 +238,29 @@ export function imageCapabilitiesFromGrokCatalog(
         }
       }
     },
-    edit: capability("image_edit"),
+    edit: {
+      ...edit,
+      parameter_constraints: {
+        ...edit.parameter_constraints,
+        images: {
+          min_items: 1,
+          max_items: 1,
+          schema_max_items: MAX_EDIT_IMAGES,
+          max_items_source: "bridge_adapter",
+          runtime_max_items: 1,
+          max_image_bytes: MAX_IMAGE_BYTES,
+          max_total_request_bytes: MAX_IMAGE_BODY,
+          multipart_fields: ["image", "image[]"],
+          json_refs: {
+            file_id: true,
+            image_url: {
+              schemes: ["data"],
+              max_chars: MAX_IMAGE_URL_CHARS
+            }
+          }
+        }
+      }
+    },
     responsesImageGeneration: {
       ...generation,
       supported_openai_params: ["size"],
@@ -1043,7 +1070,13 @@ function grokToolName(value: unknown) {
 }
 
 export const runGrokImage: ImageRunner = async (input, options = {}) => {
-  if (input.imagePath && input.size) {
+  const imagePaths = input.imagePaths ?? [];
+  if (imagePaths.length > 1) {
+    throw Object.assign(new Error("Grok image_edit supports at most one input image."), {
+      status: 400
+    });
+  }
+  if (imagePaths.length && input.size) {
     throw Object.assign(new Error("Grok ignores aspect_ratio for single-image edits."), {
       status: 400
     });
@@ -1055,7 +1088,7 @@ export const runGrokImage: ImageRunner = async (input, options = {}) => {
     join(grokHomePath(), "sessions"),
     encodeURIComponent(cwd)
   );
-  const expectedTool = input.imagePath ? "image_edit" : "image_gen";
+  const expectedTool = imagePaths.length ? "image_edit" : "image_gen";
   const args = [
     "--no-auto-update",
     "--disable-web-search",
@@ -1227,8 +1260,8 @@ export const runGrokImage: ImageRunner = async (input, options = {}) => {
       sessionId,
       prompt: [{
         type: "text",
-        text: input.imagePath
-          ? `Call image_edit with prompt ${JSON.stringify(input.prompt)} and image ${JSON.stringify(input.imagePath)}.`
+        text: imagePaths.length
+          ? `Call image_edit with prompt ${JSON.stringify(input.prompt)} and image ${JSON.stringify(imagePaths[0])}.`
           : `Call image_gen with prompt ${JSON.stringify(input.prompt)}${input.size
               ? ` and aspect_ratio ${JSON.stringify(grokAspectRatioForSize(input.size))}`
               : ""}.`

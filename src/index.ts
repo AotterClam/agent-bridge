@@ -635,12 +635,12 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     const mediaType = request.headers["content-type"]?.split(";", 1)[0];
     if (
       (!isImageEdit && mediaType !== "application/json") ||
-      (isImageEdit && mediaType !== "multipart/form-data")
+      (isImageEdit && mediaType !== "multipart/form-data" && mediaType !== "application/json")
     ) {
       return json(response, 400, {
         error: {
           message: isImageEdit
-            ? "Content-Type must be multipart/form-data"
+            ? "Content-Type must be application/json or multipart/form-data"
             : "Content-Type must be application/json"
         }
       });
@@ -668,20 +668,33 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           );
         }
         const parsed = isImageEdit
-          ? await parseEditRequest(request)
+          ? await parseEditRequest(request, fileStore, adapter)
           : await parseGenerationRequest(request);
-        if (
-          parsed.input.size &&
-          !capability!.images[operation].supported_openai_params.includes("size")
-        ) {
-          throw Object.assign(
-            new Error(`${adapter} does not support size for image ${operation}.`),
-            { status: 400 }
-          );
-        }
-        logInfo.model = parsed.input.model;
-        logInfo.imageOperation = isImageEdit ? "edit" : "generation";
         try {
+          if (
+            parsed.input.size &&
+            !capability!.images[operation].supported_openai_params.includes("size")
+          ) {
+            throw Object.assign(
+              new Error(`${adapter} does not support size for image ${operation}.`),
+              { status: 400 }
+            );
+          }
+          const maxImages = Number(record(
+            capability!.images[operation].parameter_constraints.images
+          ).max_items);
+          if (
+            parsed.input.imagePaths &&
+            Number.isFinite(maxImages) &&
+            parsed.input.imagePaths.length > maxImages
+          ) {
+            throw Object.assign(
+              new Error(`${adapter} supports at most ${maxImages} edit image${maxImages === 1 ? "" : "s"}.`),
+              { status: 400 }
+            );
+          }
+          logInfo.model = parsed.input.model;
+          logInfo.imageOperation = isImageEdit ? "edit" : "generation";
           await pipe(
             imageResponse(await image(parsed.input, { signal: controller.signal })),
             response
