@@ -142,7 +142,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1" } } });
     const prompt = message.params.input[0].text;
-    if (prompt.includes("Do not call a function.")) {
+    if (message.params.input.some((part) => part.type === "image")) {
+      send({ method: "item/agentMessage/delta", params: { delta: "vision" } });
+      send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    } else if (prompt.includes("Do not call a function.")) {
       send({ method: "item/agentMessage/delta", params: { delta: "finalized" } });
       send({ method: "turn/completed", params: { turn: { status: "completed" } } });
     } else if (prompt.includes("second result")) {
@@ -206,6 +209,17 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       tools,
       tool_choice: "none"
     }))).toMatchObject({ content: "finalized", finishReason: "stop" });
+
+    expect(await runCodex(chatRequestSchema.parse({
+      model: "test",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "inspect" },
+          { type: "image_url", image_url: "data:image/png;base64,iVBORw0KGgo=" }
+        ]
+      }]
+    }))).toMatchObject({ content: "vision", finishReason: "stop" });
   } finally {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;

@@ -5,6 +5,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { promptFor, selectedTools } from "./protocol.js";
+import {
+  decodeImageDataUrl,
+  fileInputs,
+  imageInputs,
+  pdfSource,
+  validateRemoteUrl,
+} from "./inputs.js";
 
 const TOOL_PREFIX = "mcp__openai__";
 const DEFAULT_TURN_TIMEOUT_MS = 300_000;
@@ -126,6 +133,49 @@ function prepareTools(input) {
   }
 }
 
+async function* structuredPrompt(input) {
+  const content = [{ type: "text", text: promptFor(input.messages, input.tool_choice) }];
+  for (const image of imageInputs(input)) {
+    if (image.url.startsWith("data:")) {
+      const decoded = decodeImageDataUrl(image.url);
+      content.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: decoded.mediaType,
+          data: decoded.bytes.toString("base64"),
+        },
+      });
+    } else {
+      content.push({
+        type: "image",
+        source: {
+          type: "url",
+          url: validateRemoteUrl(image.url, "image_url"),
+        },
+      });
+    }
+  }
+  for (const file of fileInputs(input)) {
+    content.push({
+      type: "document",
+      source: pdfSource(file),
+      ...(file.filename ? { title: file.filename } : {}),
+    });
+  }
+  yield {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  };
+}
+
+function sdkPrompt(input) {
+  return imageInputs(input).length || fileInputs(input).length
+    ? structuredPrompt(input)
+    : promptFor(input.messages, input.tool_choice);
+}
+
 export function streamEventDelta(event, toolCallIndexes = new Map()) {
   const toolCallIndex = (contentIndex) => {
     if (!toolCallIndexes.has(contentIndex)) {
@@ -223,7 +273,7 @@ export async function runClaudeTurn(input, options = {}) {
   timer.unref?.();
   const queryFn = options.queryFn ?? claudeQuery;
   const stream = queryFn({
-    prompt: promptFor(input.messages, input.tool_choice),
+    prompt: sdkPrompt(input),
     options: {
       model: input.model,
       maxTurns: BRIDGE_SDK_TURN_BUDGET,

@@ -347,6 +347,39 @@ Chat completions support standard JSON and SSE streaming responses, OpenAI funct
 
 `/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. Nothing is stored server-side, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
+### Image and file inputs
+
+The bridge accepts OpenAI's binary input shapes rather than embedding bytes in a text prompt:
+
+- Chat Completions: `image_url`, `input_audio`, and `file` user content parts.
+- Responses: `input_image` and `input_file` user content parts.
+- Image bytes use a base64 data URL; PDF `file_data` accepts raw base64 or a data URL. HTTP(S) URLs are passed only where the provider transport supports them.
+- Base64 image, audio, and PDF inputs are limited to 20 MiB decoded; the JSON request body is limited to 30 MiB.
+
+| Adapter | Image input | Audio input | PDF input |
+| :--- | :--- | :--- | :--- |
+| Codex | URL or data URL; `detail=auto/low/high` | base64 WAV or MP3 | No |
+| Claude | URL or data URL; `detail=auto` | No | URL or base64 |
+| Grok | Data URL only; `detail=auto`, no selected tools, prompt JSON at most 192 KiB | No | Not enabled (`embeddedContext` alone is insufficient evidence) |
+| Antigravity | Not through headless mode. Its native TUI accepts image and video attachments, but `stream-json` currently transports text only. | No | No |
+
+Because Grok's ACP currently reports `image=false` while its separate `--prompt-json` lane accepts images, discovery starts at `unknown`; the first successful non-streaming image request promotes that cached cell to `supported` for the running bridge.
+
+```sh
+curl http://127.0.0.1:3457/v1/responses \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"<MODEL_ID>",
+    "input":[{"role":"user","content":[
+      {"type":"input_text","text":"What is in this image?"},
+      {"type":"input_image","image_url":"data:image/png;base64,<BASE64>"}
+    ]}]
+  }'
+```
+
+This is not an arbitrary-file upload service. There is no `/v1/files` storage layer, so `file_id` is rejected. `input_file` currently accepts PDFs only; send text as `input_text`. DOCX, archives, executables, and other opaque binaries are rejected instead of silently converted. OpenAI-compatible clients such as AI SDK and Mastra work when they serialize into these same wire parts; they do not expand the provider capability.
+
 ### Images compatibility
 
 Codex and Grok support the OpenAI SDK request/response shape for single-image generation and edits. The bridge accepts `n=1`, `response_format=b64_json`, and one PNG, JPEG, or WebP edit input. It rejects unsupported optional controls instead of silently ignoring them.
@@ -388,11 +421,11 @@ curl http://127.0.0.1:3457/v1/responses \
 
 `GET /capabilities` probes the CLI executable installed on the user's host. Its real path and version are returned only as a fingerprint; support is determined from the runtime's own capability response or tool catalog, not a version allowlist. Results are cached for the server lifetime; use `GET /capabilities?refresh=1` after changing a CLI installation.
 
-Each image operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. It also exposes LiteLLM's `supported_openai_params` name, strict `parameter_constraints`, and the underlying runtime's unnormalized `provider_capabilities`. Consumers can therefore use the portable OpenAI fields when possible without losing provider-specific controls and caveats.
+Each input type and image output operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. Input cells expose `supported_openai_content_parts`; image output cells expose LiteLLM's `supported_openai_params`. Both include strict `parameter_constraints` and the underlying runtime's unnormalized `provider_capabilities`, so consumers can use portable OpenAI fields without losing provider-specific controls and caveats.
 
-Codex currently self-reports image support, but its app-server image tool does not expose `size` even though its internal Images client has that field; the bridge reports the host-controllable surface, not a guessed backend maximum. Grok versions without a tool catalog start as `unknown` and are promoted after the first successful live image request. Claude images are unsupported. Antigravity's installed executable schema is reported under `provider_capabilities` (including edit/reference inputs and aspect ratios), while bridge execution remains disabled because the CLI does not offer safe single-tool authorization; the bridge does not enable its unrestricted permission bypass.
+Codex currently self-reports image generation support, but its app-server image tool does not expose `size` even though its internal Images client has that field; the bridge reports the host-controllable surface, not a guessed backend maximum. Grok versions without a tool catalog start as `unknown` and are promoted after the first successful live image request. Claude image generation is unsupported. Antigravity's installed executable schema is reported under `provider_capabilities` (including edit/reference inputs and aspect ratios), while bridge execution remains disabled because the CLI does not offer safe single-tool authorization; the bridge does not enable its unrestricted permission bypass.
 
-`GET /v1/model/info` (and LiteLLM's `/model/info` alias) uses the caller's adapter capability token and returns LiteLLM-shaped `model_name`, `litellm_params`, and `model_info.supported_openai_params`. Bridge-specific operation evidence stays namespaced under `model_info.agent_bridge.images`.
+`GET /v1/model/info` (and LiteLLM's `/model/info` alias) uses the caller's adapter capability token and returns LiteLLM-shaped `model_name`, `litellm_params`, `model_info.supports_vision`, `supports_audio_input`, `supports_pdf_input`, and `supported_openai_params`. Bridge-specific evidence stays namespaced under `model_info.agent_bridge.inputs` and `.images`.
 
 To verify the wire shape with the official OpenAI SDK through an independent conformance runner:
 

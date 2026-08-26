@@ -154,6 +154,30 @@ test("tags translation failures as 400s", () => {
   }
 });
 
+test("translates OpenAI image and file input parts", () => {
+  const chat = toChatRequest(request({
+    input: [{
+      role: "user",
+      content: [
+        { type: "input_text", text: "inspect" },
+        { type: "input_image", image_url: "https://example.com/a.png", detail: "high" },
+        { type: "input_file", file_data: "JVBERi0=", filename: "a.pdf" }
+      ]
+    }]
+  }));
+  expect(chat.messages[0]).toEqual({
+    role: "user",
+    content: [
+      { type: "text", text: "inspect" },
+      {
+        type: "image_url",
+        image_url: { url: "https://example.com/a.png", detail: "high" }
+      },
+      { type: "file", file: { file_data: "JVBERi0=", filename: "a.pdf" } }
+    ]
+  });
+});
+
 test("rejects stateful and unsupported requests loudly", () => {
   expect(() =>
     toChatRequest(request({ previous_response_id: "resp_1" }))
@@ -161,13 +185,9 @@ test("rejects stateful and unsupported requests loudly", () => {
   expect(() =>
     toChatRequest(request({ tools: [{ type: "web_search" }] }))
   ).toThrow("Only function tools");
-  expect(() =>
-    toChatRequest(
-      request({
-        input: [{ role: "user", content: [{ type: "input_image", image_url: "x" }] }]
-      })
-    )
-  ).toThrow('content part "input_image"');
+  expect(() => toChatRequest(request({
+    input: [{ role: "user", content: [{ type: "input_image", file_id: "file_1" }] }]
+  }))).toThrow("stores no files");
   expect(() =>
     toChatRequest(request({ input: [{ type: "item_reference", id: "x" }] }))
   ).toThrow('input item "item_reference"');

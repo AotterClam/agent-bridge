@@ -1,8 +1,39 @@
 import { z } from "zod";
 
+const textPart = z.object({ type: z.literal("text"), text: z.string() });
+const imageUrlPart = z.object({
+  type: z.literal("image_url"),
+  image_url: z.union([
+    z.string(),
+    z.object({
+      url: z.string(),
+      detail: z.enum(["auto", "low", "high"]).optional()
+    })
+  ])
+});
+const audioPart = z.object({
+  type: z.literal("input_audio"),
+  input_audio: z.object({
+    data: z.string(),
+    format: z.enum(["wav", "mp3"])
+  })
+});
+const filePart = z.object({
+  type: z.literal("file"),
+  file: z.object({
+    filename: z.string().optional(),
+    file_data: z.string().optional(),
+    file_url: z.string().optional(),
+    file_id: z.string().optional()
+  })
+});
 const textContent = z.union([
   z.string(),
-  z.array(z.object({ type: z.literal("text"), text: z.string() }))
+  z.array(textPart)
+]);
+const userContent = z.union([
+  z.string(),
+  z.array(z.discriminatedUnion("type", [textPart, imageUrlPart, audioPart, filePart]))
 ]);
 const functionCall = z.object({
   id: z.string(),
@@ -24,7 +55,7 @@ export const chatRequestSchema = z
       .array(
         z.discriminatedUnion("role", [
           z.object({ role: z.literal("system"), content: textContent }),
-          z.object({ role: z.literal("user"), content: textContent }),
+          z.object({ role: z.literal("user"), content: userContent }),
           z.object({
             role: z.literal("assistant"),
             content: textContent.nullable().optional(),
@@ -105,6 +136,27 @@ function text(value: z.infer<typeof textContent>) {
     : value.map((part) => part.text).join("");
 }
 
+function userTranscriptContent(value: z.infer<typeof userContent>) {
+  if (typeof value === "string") return value;
+  return value.map((part) => {
+    if (part.type === "text") return part;
+    if (part.type === "image_url") {
+      const detail = typeof part.image_url === "string"
+        ? undefined
+        : part.image_url.detail;
+      return { type: part.type, attachment: true, ...(detail ? { detail } : {}) };
+    }
+    if (part.type === "input_audio") {
+      return { type: part.type, attachment: true, format: part.input_audio.format };
+    }
+    return {
+      type: part.type,
+      attachment: true,
+      ...(part.file.filename ? { filename: part.file.filename } : {})
+    };
+  });
+}
+
 export function promptFor(messages: ChatRequest["messages"], choice: ChatRequest["tool_choice"]) {
   const transcript = messages.map((message) => {
     if (message.role === "assistant") {
@@ -122,7 +174,13 @@ export function promptFor(messages: ChatRequest["messages"], choice: ChatRequest
         content: text(message.content)
       };
     }
-    return { role: message.role, content: text(message.content) };
+    return {
+      role: message.role,
+      content:
+        message.role === "user"
+          ? userTranscriptContent(message.content)
+          : text(message.content)
+    };
   });
   const instruction =
     choice === "required"

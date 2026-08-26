@@ -14,7 +14,16 @@ import { validateImageBase64, type ImageRunner } from "./images.js";
 // lane lacks is rejected loudly rather than silently dropped.
 
 const partSchema = z
-  .object({ type: z.string(), text: z.string().optional() })
+  .object({
+    type: z.string(),
+    text: z.string().optional(),
+    detail: z.enum(["auto", "low", "high"]).optional(),
+    image_url: z.string().optional(),
+    file_id: z.string().optional(),
+    file_data: z.string().optional(),
+    file_url: z.string().optional(),
+    filename: z.string().optional()
+  })
   .passthrough();
 const itemContent = z.union([z.string(), z.array(partSchema)]);
 const itemSchema = z
@@ -98,6 +107,50 @@ function partText(
     .join("");
 }
 
+function messageContent(
+  content: z.infer<typeof itemContent>,
+  role: "system" | "user" | "assistant"
+) {
+  if (typeof content === "string" || role !== "user") {
+    return partText(content, ["input_text", "output_text", "text"]);
+  }
+  return content.map((part) => {
+    if (["input_text", "output_text", "text"].includes(part.type)) {
+      return { type: "text" as const, text: part.text ?? "" };
+    }
+    if (part.type === "input_image") {
+      if (part.file_id) {
+        badRequest("input_image file_id is not supported: this bridge stores no files.");
+      }
+      if (!part.image_url) badRequest("input_image requires image_url.");
+      return {
+        type: "image_url" as const,
+        image_url: {
+          url: part.image_url,
+          ...(part.detail ? { detail: part.detail } : {})
+        }
+      };
+    }
+    if (part.type === "input_file") {
+      if (part.file_id) {
+        badRequest("input_file file_id is not supported: this bridge stores no files.");
+      }
+      if (!part.file_data && !part.file_url) {
+        badRequest("input_file requires file_data or file_url.");
+      }
+      return {
+        type: "file" as const,
+        file: {
+          ...(part.filename ? { filename: part.filename } : {}),
+          ...(part.file_data ? { file_data: part.file_data } : {}),
+          ...(part.file_url ? { file_url: part.file_url } : {})
+        }
+      };
+    }
+    badRequest(`Unsupported content part "${part.type}".`);
+  });
+}
+
 /**
  * Controls the CLI-backed adapters cannot honor. Accepting them and
  * answering with defaults would misreport what actually ran, so any
@@ -161,11 +214,7 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
       }
       messages.push({
         role,
-        content: partText(item.content ?? "", [
-          "input_text",
-          "output_text",
-          "text"
-        ])
+        content: messageContent(item.content ?? "", role)
       });
     } else if (type === "function_call") {
       if (!item.call_id || !item.name) {

@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, rm, rmdir } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -21,6 +21,12 @@ import {
   type ImageCapabilities,
   type ImageRunner
 } from "./images.js";
+import {
+  audioInputs,
+  imageInputs,
+  MAX_INPUT_BYTES,
+  type InputCapabilities
+} from "./inputs.js";
 
 const exec = promisify(execFile);
 const REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -304,6 +310,80 @@ async function probeCodexImageCapabilities(
   }
 }
 
+export function inputCapabilitiesFromCodexSchema(
+  userInputTypes: string[] | null,
+  error?: string
+): InputCapabilities {
+  const status = (supported: boolean) =>
+    userInputTypes === null ? "unknown" as const : supported ? "supported" as const : "unsupported" as const;
+  const capability = (
+    kind: "image" | "audio" | "pdf",
+    supportedTypes: string[],
+    parts: string[],
+    constraints: Record<string, unknown>
+  ) => {
+    const supported = supportedTypes.some((type) => userInputTypes?.includes(type));
+    return {
+      status: status(supported),
+      probe: "app-server generated UserInput schema",
+      evidence: error ?? `${kind}: ${supported ? "supported" : "not advertised"}`,
+      supported_openai_content_parts: supported ? parts : [],
+      parameter_constraints: supported ? constraints : {},
+      provider_capabilities: {
+        runtime: "codex app-server",
+        user_input_types: userInputTypes ?? []
+      }
+    };
+  };
+  return {
+    image: capability(
+      "image",
+      ["image"],
+      ["image_url", "input_image"],
+      {
+        detail: { enum: ["auto", "low", "high"] },
+        source: { enum: ["http", "https", "data"] },
+        max_decoded_bytes: MAX_INPUT_BYTES
+      }
+    ),
+    audio: capability(
+      "audio",
+      ["audio"],
+      ["input_audio"],
+      { format: { enum: ["wav", "mp3"] }, max_decoded_bytes: MAX_INPUT_BYTES }
+    ),
+    pdf: capability("pdf", ["file", "localFile"], ["file", "input_file"], {})
+  };
+}
+
+async function probeCodexInputCapabilities(): Promise<InputCapabilities> {
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-inputs-"));
+  try {
+    await exec(
+      command(),
+      ["app-server", "generate-json-schema", "--experimental", "--out", cwd],
+      { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }
+    );
+    const schema = JSON.parse(await readFile(join(cwd, "ClientRequest.json"), "utf8"));
+    const userInput = record(record(schema.definitions).UserInput);
+    const variants = Array.isArray(userInput.oneOf) ? userInput.oneOf : [];
+    const types = variants.flatMap((variant) => {
+      const property = record(record(record(variant).properties).type);
+      return Array.isArray(property.enum)
+        ? property.enum.filter((value): value is string => typeof value === "string")
+        : [];
+    });
+    return inputCapabilitiesFromCodexSchema(types);
+  } catch (error) {
+    return inputCapabilitiesFromCodexSchema(
+      null,
+      error instanceof Error ? error.message : "Codex input capability probe failed"
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
+
 export async function detectCodex() {
   const cmd = command();
   let version: string | null = null;
@@ -319,6 +399,7 @@ export async function detectCodex() {
       version: null,
       error: error instanceof Error ? error.message : "Codex CLI not found.",
       models: [],
+      inputs: inputCapabilitiesFromCodexSchema(null, "Codex CLI unavailable"),
       images: imageCapabilitiesFromCodexProbe(
         undefined,
         fingerprint,
@@ -329,6 +410,7 @@ export async function detectCodex() {
 
   const fingerprint = await executableFingerprint(cmd, version);
   const images = probeCodexImageCapabilities(fingerprint);
+  const inputs = probeCodexInputCapabilities();
 
   try {
     const { stdout } = await exec(cmd, ["debug", "models", "--bundled"], {
@@ -363,6 +445,7 @@ export async function detectCodex() {
       version,
       error: models.length ? null : "Codex returned no models.",
       models,
+      inputs: await inputs,
       images: await images
     };
   } catch (error) {
@@ -373,6 +456,7 @@ export async function detectCodex() {
       version,
       error: error instanceof Error ? error.message : "Codex unavailable.",
       models: [],
+      inputs: await inputs,
       images: await images
     };
   }
@@ -482,7 +566,18 @@ class CodexSession {
     try {
       await this.client.request("turn/start", {
         threadId: this.threadId,
-        input: [{ type: "text", text: promptFor(input.messages, input.tool_choice), text_elements: [] }],
+        input: [
+          { type: "text", text: promptFor(input.messages, input.tool_choice), text_elements: [] },
+          ...imageInputs(input).map((image) => ({
+            type: "image",
+            url: image.url,
+            ...(image.detail ? { detail: image.detail } : {})
+          })),
+          ...audioInputs(input).map((audio) => ({
+            type: "audio",
+            url: `data:audio/${audio.format === "mp3" ? "mpeg" : "wav"};base64,${audio.data}`
+          }))
+        ],
         ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}),
         summary: "concise"
       });

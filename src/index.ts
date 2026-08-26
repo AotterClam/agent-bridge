@@ -32,7 +32,11 @@ import {
   type ChatRunner,
   type ChatTurn
 } from "./protocol.js";
-import { respondResponses, responsesRequestSchema } from "./responses.js";
+import {
+  respondResponses,
+  responsesRequestSchema,
+  toChatRequest
+} from "./responses.js";
 import {
   type ImageCapabilities,
   type ImageCapabilityStatus,
@@ -40,6 +44,17 @@ import {
   parseEditRequest,
   parseGenerationRequest
 } from "./images.js";
+import {
+  audioInputs,
+  decodeAudioInput,
+  decodeImageDataUrl,
+  fileInputs,
+  imageInputs,
+  MAX_INPUT_BYTES,
+  pdfSource,
+  validateRemoteUrl,
+  type InputCapabilities
+} from "./inputs.js";
 import { z } from "zod";
 
 export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
@@ -49,6 +64,7 @@ export type AdapterCapability = {
   available: boolean;
   version: string | null;
   error: string | null;
+  inputs: InputCapabilities;
   images: ImageCapabilities;
   models: Array<{
     id: string;
@@ -69,6 +85,29 @@ const imageCapabilitySchema = z.object({
   parameter_constraints: z.record(z.string(), z.unknown()).default({}),
   provider_capabilities: z.record(z.string(), z.unknown()).default({})
 });
+const inputCapabilitySchema = z.object({
+  status: z.enum(["supported", "unsupported", "unknown"]),
+  probe: z.string(),
+  evidence: z.string(),
+  supported_openai_content_parts: z.array(z.string()).default([]),
+  parameter_constraints: z.record(z.string(), z.unknown()).default({}),
+  provider_capabilities: z.record(z.string(), z.unknown()).default({})
+});
+const legacyUnknownInputs = () => {
+  const unknown = {
+    status: "unknown" as const,
+    probe: "legacy-server",
+    evidence: "Input capabilities were not reported by this Agent Bridge server",
+    supported_openai_content_parts: [] as string[],
+    parameter_constraints: {},
+    provider_capabilities: {}
+  };
+  return {
+    image: { ...unknown },
+    audio: { ...unknown },
+    pdf: { ...unknown }
+  };
+};
 const legacyUnknownImages = () => {
   const unknown = {
     status: "unknown" as const,
@@ -94,6 +133,11 @@ const capabilitiesResponseSchema = z.object({
     version: z.string().nullable(),
     error: z.string().nullable(),
     capabilityToken: z.string().min(1),
+    inputs: z.object({
+      image: inputCapabilitySchema,
+      audio: inputCapabilitySchema,
+      pdf: inputCapabilitySchema
+    }).default(legacyUnknownInputs),
     images: z.object({
       generation: imageCapabilitySchema,
       edit: imageCapabilitySchema,
@@ -112,7 +156,7 @@ const capabilitiesResponseSchema = z.object({
   }))
 });
 
-const MAX_BODY = 2 * 1024 * 1024;
+const MAX_BODY = 30 * 1024 * 1024;
 
 export function capabilityToken(controlToken: string, adapter: AdapterId) {
   return createHmac("sha256", controlToken)
@@ -132,6 +176,49 @@ async function detectClaude(): Promise<AdapterCapability> {
       image_generation: "not exposed to this bridge"
     }
   } as const;
+  const inputs: InputCapabilities = {
+    image: {
+      status: "supported",
+      probe: "Claude Agent SDK MessageParam schema",
+      evidence: "ImageBlockParam accepts URL and base64 image sources",
+      supported_openai_content_parts: ["image_url", "input_image"],
+      parameter_constraints: {
+        source: { enum: ["http", "https", "data"] },
+        media_type: { enum: ["image/png", "image/jpeg", "image/gif", "image/webp"] },
+        detail: { enum: ["auto"] },
+        max_decoded_bytes: MAX_INPUT_BYTES
+      },
+      provider_capabilities: {
+        runtime: "Claude Agent SDK",
+        content_block: "image"
+      }
+    },
+    audio: {
+      status: "unsupported",
+      probe: "Claude Agent SDK MessageParam schema",
+      evidence: "No audio input content block is exposed",
+      supported_openai_content_parts: [],
+      parameter_constraints: {},
+      provider_capabilities: { runtime: "Claude Agent SDK" }
+    },
+    pdf: {
+      status: "supported",
+      probe: "Claude Agent SDK MessageParam schema",
+      evidence: "DocumentBlockParam accepts URL and base64 PDF sources",
+      supported_openai_content_parts: ["file", "input_file"],
+      parameter_constraints: {
+        media_type: { enum: ["application/pdf"] },
+        source: { enum: ["http", "https", "data"] },
+        file_id: false,
+        max_decoded_bytes: MAX_INPUT_BYTES
+      },
+      provider_capabilities: {
+        runtime: "Claude Agent SDK",
+        content_block: "document",
+        media_type: "application/pdf"
+      }
+    }
+  };
   try {
     const models = await discoverClaudeModels();
     return {
@@ -140,6 +227,7 @@ async function detectClaude(): Promise<AdapterCapability> {
       available: models.length > 0,
       version: null,
       error: models.length ? null : "Claude Agent SDK returned no models.",
+      inputs,
       images: {
         generation: { ...unsupported },
         edit: { ...unsupported },
@@ -165,6 +253,7 @@ async function detectClaude(): Promise<AdapterCapability> {
           ? error.message
           : "Claude Agent SDK unavailable.",
       models: [],
+      inputs,
       images: {
         generation: { ...unsupported },
         edit: { ...unsupported },
@@ -193,6 +282,8 @@ export function allowsImageRunner(
 }
 
 export function liteLLMModelInfo(adapter: AdapterCapability) {
+  const supported = (status: "supported" | "unsupported" | "unknown") =>
+    status === "supported" ? true : status === "unsupported" ? false : null;
   return adapter.models.map((model) => ({
     model_name: model.id,
     litellm_params: { model: model.id },
@@ -205,7 +296,14 @@ export function liteLLMModelInfo(adapter: AdapterCapability) {
         "tool_choice",
         ...(model.reasoningEfforts.length ? ["reasoning_effort"] : [])
       ],
-      agent_bridge: { adapter_id: adapter.id, images: adapter.images }
+      supports_vision: supported(adapter.inputs.image.status),
+      supports_audio_input: supported(adapter.inputs.audio.status),
+      supports_pdf_input: supported(adapter.inputs.pdf.status),
+      agent_bridge: {
+        adapter_id: adapter.id,
+        inputs: adapter.inputs,
+        images: adapter.images
+      }
     }
   }));
 }
@@ -224,7 +322,7 @@ async function body(request: IncomingMessage) {
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     bytes += chunk.length;
     if (bytes > MAX_BODY) {
-      throw Object.assign(new Error("Request exceeds 2 MiB"), { status: 413 });
+      throw Object.assign(new Error("Request exceeds 30 MiB"), { status: 413 });
     }
     chunks.push(chunk);
   }
@@ -259,6 +357,46 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 const runClaude = createClaudeRunner() as ChatRunner & { close(): void };
+
+function validateInputs(input: z.infer<typeof chatRequestSchema>, capability: AdapterCapability) {
+  const images = imageInputs(input);
+  const audio = audioInputs(input);
+  const files = fileInputs(input);
+  for (const [kind, values] of [
+    ["image", images],
+    ["audio", audio],
+    ["pdf", files]
+  ] as const) {
+    const cell = capability.inputs[kind];
+    const grokLiveProbe =
+      capability.id === "grok" &&
+      kind === "image" &&
+      cell.status === "unknown" &&
+      cell.provider_capabilities.prompt_json === true;
+    if (values.length && cell.status !== "supported" && !grokLiveProbe) {
+      throw Object.assign(
+        new Error(`${capability.id} does not support ${kind} input through this bridge.`),
+        { status: 400 }
+      );
+    }
+  }
+  const sources = record(capability.inputs.image.parameter_constraints.source).enum;
+  const details = record(capability.inputs.image.parameter_constraints.detail).enum;
+  for (const image of images) {
+    const source = image.url.startsWith("data:") ? "data" : new URL(validateRemoteUrl(image.url, "image_url")).protocol.slice(0, -1);
+    if (Array.isArray(sources) && !sources.includes(source)) {
+      throw Object.assign(new Error(`${capability.id} does not support ${source} image input.`), { status: 400 });
+    }
+    if (source === "data") decodeImageDataUrl(image.url);
+    if (image.detail && Array.isArray(details) && !details.includes(image.detail)) {
+      throw Object.assign(new Error(`${capability.id} does not support image detail=${image.detail}.`), { status: 400 });
+    }
+  }
+  for (const item of audio) {
+    decodeAudioInput(item);
+  }
+  for (const file of files) pdfSource(file);
+}
 
 import {
   createLogger,
@@ -317,6 +455,22 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     cell.status = "supported";
     cell.probe = "live-request";
     cell.evidence = `${operation} completed successfully on this host`;
+  };
+  const markInputSupported = (
+    capability: AdapterCapability,
+    input: z.infer<typeof chatRequestSchema>
+  ) => {
+    for (const [kind, count] of [
+      ["image", imageInputs(input).length],
+      ["audio", audioInputs(input).length],
+      ["pdf", fileInputs(input).length]
+    ] as const) {
+      const cell = capability.inputs[kind];
+      if (!count || cell.status !== "unknown") continue;
+      cell.status = "supported";
+      cell.probe = "live-request";
+      cell.evidence = `${kind} input completed successfully on this host`;
+    }
   };
   if (options.preloadModels) void capabilities();
   const server = createServer(async (request, response) => {
@@ -485,12 +639,16 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         }
         logInfo.model = parsed.data.model;
         logInfo.stream = Boolean(parsed.data.stream);
+        const adapterCapability = (await capabilities()).find(
+          (item) => item.id === adapter
+        );
+        if (!adapterCapability) throw new Error(`${adapter} capability unavailable.`);
+        const chatInput = toChatRequest(parsed.data);
+        validateInputs(chatInput, adapterCapability);
         const usesImage = parsed.data.tools?.some(
           (tool) => tool.type === "image_generation"
         ) ?? false;
-        const capability = usesImage
-          ? (await capabilities()).find((item) => item.id === adapter)
-          : undefined;
+        const capability = usesImage ? adapterCapability : undefined;
         const image =
           usesImage &&
           runtime.imageCandidate &&
@@ -523,6 +681,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           ),
           response
         );
+        if (!parsed.data.stream) markInputSupported(adapterCapability, chatInput);
         if (usesImage) {
           markImageSupported(capability, "responsesImageGeneration");
         }
@@ -536,10 +695,16 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       }
       logInfo.model = parsed.data.model;
       logInfo.stream = Boolean(parsed.data.stream);
+      const adapterCapability = (await capabilities()).find(
+        (item) => item.id === adapter
+      );
+      if (!adapterCapability) throw new Error(`${adapter} capability unavailable.`);
+      validateInputs(parsed.data, adapterCapability);
       await pipe(
         await respond(parsed.data, runtime.run, controller.signal),
         response
       );
+      if (!parsed.data.stream) markInputSupported(adapterCapability, parsed.data);
     } catch (error) {
       logInfo.error = error instanceof Error ? error.message : String(error);
       if (response.headersSent) return response.end();

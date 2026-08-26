@@ -99,8 +99,23 @@ if (process.argv.includes("--version")) {
   console.log("grok 1.0.3 (test)");
   process.exit(0);
 }
+if (process.argv.includes("--help")) {
+  console.log("--prompt-json <JSON>");
+  process.exit(0);
+}
 if (process.argv.includes("models")) {
   console.log("Available models:\\n  * grok-4.6");
+  process.exit(0);
+}
+const promptJson = process.argv.indexOf("--prompt-json");
+if (promptJson >= 0) {
+  const blocks = JSON.parse(process.argv[promptJson + 1]);
+  const image = blocks.find((block) => block.type === "image");
+  console.log(JSON.stringify({
+    text: "VISION: " + image.mimeType,
+    thought: "looked",
+    usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3, reasoning_tokens: 1 }
+  }));
   process.exit(0);
 }
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
@@ -260,3 +275,31 @@ test("runs a Grok ACP text turn and returns a host tool call", async () => {
       .toMatchObject({ content: "RESULT1RESULT2", finishReason: "stop" });
   });
 }, 10_000);
+
+test("uses Grok prompt-json for base64 image input", async () => {
+  await withFakeGrok(async () => {
+    const deltas: Array<Record<string, unknown>> = [];
+    const turn = await runGrok(chatRequestSchema.parse({
+      model: "grok-4.6",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          {
+            type: "image_url",
+            image_url: "data:image/png;base64,iVBORw0KGgo="
+          }
+        ]
+      }]
+    }), { onDelta: (delta) => deltas.push(delta) });
+    expect(turn).toMatchObject({
+      content: "VISION: image/png",
+      finishReason: "stop",
+      usage: { totalTokens: 3 }
+    });
+    expect(deltas).toEqual([
+      { reasoning_content: "looked" },
+      { content: "VISION: image/png" }
+    ]);
+  });
+});

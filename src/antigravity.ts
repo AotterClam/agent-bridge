@@ -16,6 +16,7 @@ import {
   executableFingerprint,
   type ImageCapabilities
 } from "./images.js";
+import type { InputCapabilities } from "./inputs.js";
 
 const exec = promisify(execFile);
 const DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS = 300_000;
@@ -508,6 +509,47 @@ export function imageCapabilitiesFromAntigravityProbe(
   };
 }
 
+export function inputCapabilitiesFromAntigravityProbe(
+  available: boolean,
+  error?: string
+): InputCapabilities {
+  const provider = {
+    runtime: "Antigravity CLI",
+    native_ui: {
+      image: {
+        status: "supported",
+        source: "clipboard attachment",
+        media_types: [
+          "image/png", "image/jpeg", "image/gif", "image/webp",
+          "image/bmp", "image/tiff", "image/svg+xml"
+        ]
+      },
+      video: {
+        status: "supported",
+        media_types: ["video/mp4", "video/quicktime", "video/webm", "video/x-msvideo"]
+      }
+    },
+    headless_transport: {
+      input_format: "stream-json",
+      content_blocks: ["text"],
+      media_paths_live_smoke: false
+    }
+  };
+  const unsupported = (kind: string) => ({
+    status: available ? "unsupported" as const : "unknown" as const,
+    probe: "headless stream-json schema + live media-path smoke",
+    evidence: error ?? `${kind} is not accepted by Antigravity's headless transport`,
+    supported_openai_content_parts: [],
+    parameter_constraints: {},
+    provider_capabilities: provider
+  });
+  return {
+    image: unsupported("image"),
+    audio: unsupported("audio"),
+    pdf: unsupported("PDF")
+  };
+}
+
 async function probeAntigravityImageCapabilities(
   fingerprint: ImageCapabilities["fingerprint"]
 ) {
@@ -549,6 +591,7 @@ export async function detectAntigravity() {
     const models = parseAgyModels(modelsStdout);
     const fingerprint = await executableFingerprint(cmd, version);
     const images = await probeAntigravityImageCapabilities(fingerprint);
+    const inputs = inputCapabilitiesFromAntigravityProbe(true);
 
     if (models.length === 0) {
       return {
@@ -558,6 +601,7 @@ export async function detectAntigravity() {
         version,
         error: "No authorized models returned by Antigravity CLI",
         models: [],
+        inputs,
         images
       };
     }
@@ -578,6 +622,7 @@ export async function detectAntigravity() {
           ? { defaultReasoningEffort: m.defaultReasoningEffort }
           : {})
       })),
+      inputs,
       images
     };
   } catch (error) {
@@ -589,6 +634,10 @@ export async function detectAntigravity() {
       version: null,
       error: error instanceof Error ? error.message : "Antigravity CLI unavailable.",
       models: [],
+      inputs: inputCapabilitiesFromAntigravityProbe(
+        false,
+        "Antigravity CLI unavailable"
+      ),
       images: imageCapabilitiesFromAntigravityProbe(
         null,
         null,

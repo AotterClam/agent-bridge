@@ -1,10 +1,17 @@
 import { expect, test } from "bun:test";
 import {
   antigravityImageToolFromText,
-  imageCapabilitiesFromAntigravityProbe
+  imageCapabilitiesFromAntigravityProbe,
+  inputCapabilitiesFromAntigravityProbe
 } from "../src/antigravity.js";
-import { imageCapabilitiesFromCodexProbe } from "../src/codex.js";
-import { imageCapabilitiesFromGrokCatalog } from "../src/grok.js";
+import {
+  imageCapabilitiesFromCodexProbe,
+  inputCapabilitiesFromCodexSchema
+} from "../src/codex.js";
+import {
+  imageCapabilitiesFromGrokCatalog,
+  inputCapabilitiesFromGrokProbe
+} from "../src/grok.js";
 import {
   allowsImageRunner,
   cachedCapabilities,
@@ -68,12 +75,17 @@ test("maps host self-report and tool catalog evidence without version guessing",
 
 test("exposes LiteLLM model-info names while retaining bridge-native evidence", () => {
   const images = imageCapabilitiesFromGrokCatalog(["image_gen", "image_edit"], fingerprint);
+  const inputs = inputCapabilitiesFromGrokProbe(
+    { image: false, audio: false, embeddedContext: true },
+    true
+  );
   const [info] = liteLLMModelInfo({
     id: "grok",
     name: "Grok Build",
     available: true,
     version: fingerprint.version,
     error: null,
+    inputs,
     images,
     models: [{
       id: "grok-test",
@@ -86,11 +98,41 @@ test("exposes LiteLLM model-info names while retaining bridge-native evidence", 
     litellm_params: { model: "grok-test" },
     model_info: {
       supported_openai_params: ["stream", "tools", "tool_choice", "reasoning_effort"],
+      supports_vision: null,
+      supports_audio_input: false,
+      supports_pdf_input: null,
       agent_bridge: {
         adapter_id: "grok",
+        inputs: { image: { parameter_constraints: { source: { enum: ["data"] } } } },
         images: { generation: { supported_openai_params: expect.arrayContaining(["size"]) } }
       }
     }
+  });
+});
+
+test("reports host input transports without reducing native provider evidence", () => {
+  const codex = inputCapabilitiesFromCodexSchema([
+    "text", "image", "localImage", "audio", "localAudio"
+  ]);
+  expect(codex.image.status).toBe("supported");
+  expect(codex.audio.status).toBe("supported");
+  expect(codex.pdf.status).toBe("unsupported");
+
+  const grok = inputCapabilitiesFromGrokProbe(
+    { image: false, audio: false, embeddedContext: true },
+    true
+  );
+  expect(grok.image.status).toBe("unknown");
+  expect(grok.image.parameter_constraints).toMatchObject({
+    source: { enum: ["data"] },
+    selected_tools: { max_items: 0 }
+  });
+
+  const agy = inputCapabilitiesFromAntigravityProbe(true);
+  expect(agy.image.status).toBe("unsupported");
+  expect(agy.image.provider_capabilities).toMatchObject({
+    native_ui: { image: { status: "supported" } },
+    headless_transport: { media_paths_live_smoke: false }
   });
 });
 

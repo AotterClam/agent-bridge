@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -20,9 +21,15 @@ import {
   type ImageCapabilities,
   type ImageRunner
 } from "./images.js";
+import {
+  decodeImageDataUrl,
+  imageInputs,
+  type InputCapabilities
+} from "./inputs.js";
 
 const exec = promisify(execFile);
 const DEFAULT_GROK_TURN_TIMEOUT_MS = 300_000;
+const MAX_GROK_PROMPT_JSON_BYTES = 192 * 1024;
 const HOST_SERVER = "openai";
 const HOST_PREFIX = `${HOST_SERVER}__`;
 
@@ -270,7 +277,8 @@ async function discoverGrokModelsViaAcp() {
     ]);
     return {
       models: modelsFromGrokInitialize(init),
-      toolCatalog: grokToolCatalogFromInitialize(init)
+      toolCatalog: grokToolCatalogFromInitialize(init),
+      promptCapabilities: record(record(record(init).agentCapabilities).promptCapabilities)
     };
   } finally {
     client.close();
@@ -288,13 +296,77 @@ async function discoverGrokModelsViaAcp() {
   }
 }
 
+export function inputCapabilitiesFromGrokProbe(
+  promptCapabilities: Record<string, unknown> | null,
+  promptJsonAdvertised: boolean | null,
+  error?: string
+): InputCapabilities {
+  const raw = {
+    runtime: "Grok Build",
+    acp_prompt_capabilities: promptCapabilities ?? {},
+    prompt_json: promptJsonAdvertised
+  };
+  const imageSupported =
+    promptJsonAdvertised === true && promptCapabilities?.image === true;
+  const imageUnknown = promptJsonAdvertised === true && !imageSupported;
+  return {
+    image: {
+      status: imageSupported
+        ? "supported"
+        : imageUnknown
+          ? "unknown"
+        : promptJsonAdvertised === false
+          ? "unsupported"
+          : "unknown",
+      probe: "ACP initialize + CLI --help",
+      evidence: error ?? (imageSupported
+        ? "ACP image and --prompt-json are advertised"
+        : imageUnknown
+          ? "--prompt-json is advertised but ACP image=false; awaiting a live bridge smoke"
+          : "No structured image input lane advertised"),
+      supported_openai_content_parts: imageSupported || imageUnknown
+        ? ["image_url", "input_image"]
+        : [],
+      parameter_constraints: imageSupported || imageUnknown
+        ? {
+            source: { enum: ["data"] },
+            media_type: { enum: ["image/png", "image/jpeg", "image/gif", "image/webp"] },
+            detail: { enum: ["auto"] },
+            selected_tools: { max_items: 0 },
+            prompt_json_max_bytes: MAX_GROK_PROMPT_JSON_BYTES
+          }
+        : {},
+      provider_capabilities: raw
+    },
+    audio: {
+      status: promptCapabilities?.audio === false ? "unsupported" : "unknown",
+      probe: "ACP initialize",
+      evidence: `audio=${String(promptCapabilities?.audio)}`,
+      supported_openai_content_parts: [],
+      parameter_constraints: {},
+      provider_capabilities: raw
+    },
+    pdf: {
+      status: promptCapabilities?.embeddedContext === true ? "unknown" : "unsupported",
+      probe: "ACP initialize",
+      evidence: promptCapabilities?.embeddedContext === true
+        ? "embeddedContext is advertised, but PDF input has not passed a live bridge smoke test"
+        : "embeddedContext is not advertised",
+      supported_openai_content_parts: [],
+      parameter_constraints: {},
+      provider_capabilities: raw
+    }
+  };
+}
+
 export async function detectGrok() {
   const cmd = command();
   try {
     let acpError: string | undefined;
-    const [{ stdout: version }, acp] = await Promise.all([
+    const [{ stdout: version }, acp, help] = await Promise.all([
       exec(cmd, ["--version"], { timeout: 5_000 }),
-      discoverGrokModelsViaAcp().catch(() => null)
+      discoverGrokModelsViaAcp().catch(() => null),
+      exec(cmd, ["--help"], { timeout: 5_000 }).then(({ stdout }) => stdout).catch(() => "")
     ]);
     if (!acp) acpError = "Grok ACP initialize failed";
     const catalog =
@@ -311,6 +383,11 @@ export async function detectGrok() {
       version: version.trim(),
       error: catalog.length ? null : "Grok returned no models.",
       models: catalog,
+      inputs: inputCapabilitiesFromGrokProbe(
+        acp?.promptCapabilities ?? null,
+        help ? /--prompt-json\b/.test(help) : null,
+        acpError
+      ),
       images: imageCapabilitiesFromGrokCatalog(
         acp?.toolCatalog ?? null,
         fingerprint,
@@ -326,6 +403,7 @@ export async function detectGrok() {
       version: null,
       error: error instanceof Error ? error.message : "Grok unavailable.",
       models: [],
+      inputs: inputCapabilitiesFromGrokProbe(null, null, "Grok CLI unavailable"),
       images: imageCapabilitiesFromGrokCatalog(
         null,
         fingerprint,
@@ -535,6 +613,7 @@ const debugLog = process.env.AGENT_BRIDGE_GROK_DEBUG
 
 const pendingCalls = new Map<string, GrokSession>();
 const sessions = new Set<GrokSession>();
+const visionControllers = new Set<AbortController>();
 
 class GrokSession {
   private readonly client: ReturnType<typeof rpc>;
@@ -835,6 +914,7 @@ class GrokSession {
 }
 
 export async function closeGrokSessions() {
+  visionControllers.forEach((controller) => controller.abort());
   await Promise.all([
     ...[...sessions].map((session) => session.close()),
     ...[...grokImageSessions].map((close) => close())
@@ -842,6 +922,7 @@ export async function closeGrokSessions() {
 }
 
 export const runGrok: ChatRunner = async (input, options = {}) => {
+  if (imageInputs(input).length) return runGrokVision(input, options);
   for (let index = input.messages.length - 1; index >= 0; index--) {
     const message = input.messages[index];
     if (message?.role !== "tool") continue;
@@ -854,6 +935,101 @@ export const runGrok: ChatRunner = async (input, options = {}) => {
   const session = await GrokSession.create(input);
   return session.prompt(input, options);
 };
+
+async function prepareIsolatedGrokHome(cwd: string) {
+  const isolated = join(cwd, ".grok");
+  await mkdir(isolated);
+  for (const name of ["auth.json", "agent_id"]) {
+    const source = join(grokHomePath(), name);
+    if (existsSync(source)) await symlink(source, join(isolated, name));
+  }
+  return isolated;
+}
+
+async function runGrokVision(
+  input: ChatRequest,
+  options: RunOptions
+): Promise<ChatTurn> {
+  if (selectedTools(input).length) {
+    throw Object.assign(
+      new Error("Grok image input cannot be combined with selected tools."),
+      { status: 400 }
+    );
+  }
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "text", text: promptFor(input.messages, input.tool_choice) }
+  ];
+  for (const image of imageInputs(input)) {
+    if (!image.url.startsWith("data:")) {
+      throw Object.assign(
+        new Error("Grok image input currently requires a base64 data URL."),
+        { status: 400 }
+      );
+    }
+    const decoded = decodeImageDataUrl(image.url);
+    blocks.push({
+      type: "image",
+      data: decoded.bytes.toString("base64"),
+      mimeType: decoded.mediaType
+    });
+  }
+  const promptJson = JSON.stringify(blocks);
+  if (Buffer.byteLength(promptJson) > MAX_GROK_PROMPT_JSON_BYTES) {
+    throw Object.assign(
+      new Error(`Grok --prompt-json input exceeds ${MAX_GROK_PROMPT_JSON_BYTES} bytes.`),
+      { status: 413 }
+    );
+  }
+
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-grok-vision-"));
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  visionControllers.add(controller);
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const home = await prepareIsolatedGrokHome(cwd);
+    const args = [
+      "--no-auto-update",
+      "--prompt-json", promptJson,
+      "--output-format", "json",
+      "--disable-web-search",
+      "--no-subagents",
+      "--tools", ""
+    ];
+    if (input.model) args.push("--model", input.model);
+    if (input.reasoning_effort) args.push("--reasoning-effort", input.reasoning_effort);
+    const { stdout } = await exec(command(), args, {
+      cwd,
+      env: { ...grokEnvironment(cwd), GROK_HOME: home },
+      timeout: grokTurnTimeoutMs(),
+      maxBuffer: 4 * 1024 * 1024,
+      signal: controller.signal
+    });
+    const payload = record(JSON.parse(stdout));
+    const content = typeof payload.text === "string" ? payload.text : "";
+    if (!content) throw new Error("Grok prompt-json returned no text.");
+    const thought = typeof payload.thought === "string" ? payload.thought : "";
+    if (thought) options.onDelta?.({ reasoning_content: thought });
+    options.onDelta?.({ content });
+    const usage = record(payload.usage);
+    return {
+      content,
+      toolCalls: [],
+      finishReason: "stop",
+      usage: {
+        promptTokens: Number(usage.input_tokens ?? 0),
+        completionTokens: Number(usage.output_tokens ?? 0),
+        totalTokens: Number(usage.total_tokens ?? 0),
+        reasoningTokens: Number(usage.reasoning_tokens ?? 0)
+      }
+    };
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
+    visionControllers.delete(controller);
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
 
 const grokImageSessions = new Set<() => Promise<void>>();
 

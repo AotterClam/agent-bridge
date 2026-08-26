@@ -99,6 +99,47 @@ test("forwards a requested effort to the Claude SDK", async () => {
   expect(unset.options).not.toHaveProperty("effort");
 });
 
+test("sends image and PDF bytes as Claude content blocks", async () => {
+  let userMessage: any;
+  const queryFn = ({ prompt }: any) => Object.assign(
+    (async function* () {
+      for await (const message of prompt) userMessage = message;
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: { content: [{ type: "text", text: "seen" }] }
+      };
+    })(),
+    { close() {} }
+  );
+  await runClaudeTurn(chatRequestSchema.parse({
+    model: "claude-sonnet",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "inspect" },
+        { type: "image_url", image_url: "data:image/png;base64,iVBORw0KGgo=" },
+        {
+          type: "file",
+          file: {
+            filename: "tiny.pdf",
+            file_data: Buffer.from("%PDF-1.4\n").toString("base64")
+          }
+        }
+      ]
+    }]
+  }), { queryFn });
+  expect(userMessage.message.content).toMatchObject([
+    { type: "text" },
+    { type: "image", source: { type: "base64", media_type: "image/png" } },
+    {
+      type: "document",
+      title: "tiny.pdf",
+      source: { type: "base64", media_type: "application/pdf" }
+    }
+  ]);
+});
+
 test("does not report reasoning when a model withholds its thinking text", () => {
   const thinking = (text: string) => ({
     type: "content_block_delta",
