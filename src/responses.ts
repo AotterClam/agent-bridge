@@ -120,7 +120,7 @@ function messageContent(
     }
     if (part.type === "input_image") {
       if (part.file_id) {
-        badRequest("input_image file_id is not supported: this bridge stores no files.");
+        badRequest("input_image file_id must be resolved before conversion.");
       }
       if (!part.image_url) badRequest("input_image requires image_url.");
       return {
@@ -133,7 +133,7 @@ function messageContent(
     }
     if (part.type === "input_file") {
       if (part.file_id) {
-        badRequest("input_file file_id is not supported: this bridge stores no files.");
+        badRequest("input_file file_id must be resolved before conversion.");
       }
       if (!part.file_data && !part.file_url) {
         badRequest("input_file requires file_data or file_url.");

@@ -336,7 +336,10 @@ export function inputCapabilitiesFromGrokProbe(
             prompt_json_max_bytes: MAX_GROK_PROMPT_JSON_BYTES
           }
         : {},
-      provider_capabilities: raw
+      provider_capabilities: {
+        ...raw,
+        live_probe: promptJsonAdvertised === true
+      }
     },
     audio: {
       status: promptCapabilities?.audio === false ? "unsupported" : "unknown",

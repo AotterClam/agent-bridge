@@ -15,7 +15,7 @@ test("validates binary signatures and keeps attachment bytes out of transcripts"
     filename: "tiny.pdf",
     file_data: Buffer.from("%PDF-1.4\n").toString("base64")
   })).toMatchObject({ type: "base64", media_type: "application/pdf" });
-  expect(() => pdfSource({ file_id: "file_1" })).toThrow("does not store uploaded files");
+  expect(() => pdfSource({ file_id: "file_1" })).toThrow("must be resolved");
   expect(() => pdfSource({
     file_url: "https://example.com/a.pdf",
     file_data: Buffer.from("%PDF-1.4\n").toString("base64")

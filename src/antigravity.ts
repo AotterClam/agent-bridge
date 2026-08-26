@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createReadStream, existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -16,7 +16,11 @@ import {
   executableFingerprint,
   type ImageCapabilities
 } from "./images.js";
-import type { InputCapabilities } from "./inputs.js";
+import {
+  decodeImageDataUrl,
+  imageInputs,
+  type InputCapabilities
+} from "./inputs.js";
 
 const exec = promisify(execFile);
 const DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS = 300_000;
@@ -128,11 +132,15 @@ export function antigravityEnvironment(isolatedHome: string) {
   return env;
 }
 
-export async function prepareIsolatedAntigravityHome(isolatedDir: string): Promise<string> {
+export async function prepareIsolatedAntigravityHome(
+  isolatedDir: string,
+  allowedReadPaths: string[] = []
+): Promise<string> {
   const fakeHome = join(isolatedDir, "home");
   const fakeGemini = join(fakeHome, ".gemini");
   const fakeCli = join(fakeGemini, "antigravity-cli");
   await mkdir(fakeCli, { recursive: true });
+  const allowedReads = await Promise.all(allowedReadPaths.map((path) => realpath(path)));
 
   const realHome = homedir();
 
@@ -156,13 +164,24 @@ export async function prepareIsolatedAntigravityHome(isolatedDir: string): Promi
     }
   }
 
-  // 3. Write isolated settings with explicit deny rules for built-in tools and empty MCP
+  // 3. Permit only bridge-owned attachments; everything else stays denied or
+  // requires an interactive approval that headless mode cannot grant.
   const isolatedSettings = JSON.stringify({
     permissions: {
-      auto_approve: false,
-      denied_tools: ["*"],
-      allow_rules: []
+      allow: allowedReads.map((path) => `read_file(${path})`),
+      deny: [
+        "command(*)",
+        "unsandboxed(*)",
+        "write_file(*)",
+        "read_url(*)",
+        "execute_url(*)",
+        "mcp(*)"
+      ],
+      ask: []
     },
+    toolPermission: "request-review",
+    allowNonWorkspaceAccess: false,
+    enableTerminalSandbox: true,
     tools: {
       enabled: false
     },
@@ -515,6 +534,7 @@ export function inputCapabilitiesFromAntigravityProbe(
 ): InputCapabilities {
   const provider = {
     runtime: "Antigravity CLI",
+    live_probe: available,
     native_ui: {
       image: {
         status: "supported",
@@ -530,21 +550,35 @@ export function inputCapabilitiesFromAntigravityProbe(
       }
     },
     headless_transport: {
-      input_format: "stream-json",
-      content_blocks: ["text"],
-      media_paths_live_smoke: false
+      stream_json_content_blocks: ["text"],
+      image_lane: "print-mode path + scoped view_file"
     }
   };
   const unsupported = (kind: string) => ({
     status: available ? "unsupported" as const : "unknown" as const,
-    probe: "headless stream-json schema + live media-path smoke",
+    probe: "headless transport schema",
     evidence: error ?? `${kind} is not accepted by Antigravity's headless transport`,
     supported_openai_content_parts: [],
     parameter_constraints: {},
     provider_capabilities: provider
   });
   return {
-    image: unsupported("image"),
+    image: {
+      status: "unknown",
+      probe: "print-mode scoped view_file",
+      evidence: available
+        ? "Image path lane is available; awaiting a successful live bridge request"
+        : error ?? "Antigravity CLI unavailable",
+      supported_openai_content_parts: available ? ["image_url", "input_image"] : [],
+      parameter_constraints: available
+        ? {
+            source: { enum: ["data"] },
+            media_type: { enum: ["image/png", "image/jpeg", "image/gif", "image/webp"] },
+            detail: { enum: ["auto"] }
+          }
+        : {},
+      provider_capabilities: provider
+    },
     audio: unsupported("audio"),
     pdf: unsupported("PDF")
   };
@@ -591,7 +625,7 @@ export async function detectAntigravity() {
     const models = parseAgyModels(modelsStdout);
     const fingerprint = await executableFingerprint(cmd, version);
     const images = await probeAntigravityImageCapabilities(fingerprint);
-    const inputs = inputCapabilitiesFromAntigravityProbe(true);
+    const inputs = inputCapabilitiesFromAntigravityProbe(models.length > 0);
 
     if (models.length === 0) {
       return {
@@ -809,13 +843,40 @@ export class AntigravityAgentSession {
 
   async run(input: ChatRequest, options: RunOptions = {}): Promise<ChatTurn> {
     this.cwd = await mkdtemp(join(tmpdir(), "agent-bridge-antigravity-"));
-    const fakeHome = await prepareIsolatedAntigravityHome(this.cwd);
+    const workspace = join(this.cwd, "workspace");
+    await mkdir(workspace);
 
     const tools = selectedTools(input);
     const catalog = discoveredCatalog.length > 0 ? discoveredCatalog : STATIC_MODELS;
     const resolvedModel = resolveAgyModel(input.model, input.reasoning_effort, catalog);
 
-    const prompt = promptForAntigravity(input);
+    const imagePaths: string[] = [];
+    for (const [index, image] of imageInputs(input).entries()) {
+      if (!image.url.startsWith("data:")) {
+        throw Object.assign(
+          new Error("Antigravity image input currently requires a base64 data URL."),
+          { status: 400 }
+        );
+      }
+      const decoded = decodeImageDataUrl(image.url);
+      const extension = decoded.mediaType === "image/jpeg"
+        ? "jpg"
+        : decoded.mediaType.slice("image/".length);
+      const path = join(workspace, `input-${index}.${extension}`);
+      await writeFile(path, decoded.bytes, { flag: "wx" });
+      imagePaths.push(path);
+    }
+    const allowedImagePaths = new Set(
+      await Promise.all(imagePaths.map((path) => realpath(path)))
+    );
+    const fakeHome = await prepareIsolatedAntigravityHome(
+      this.cwd,
+      [...allowedImagePaths]
+    );
+    const prompt = [
+      ...imagePaths.map((path) => `Analyze the attached image at ${path}.`),
+      promptForAntigravity(input)
+    ].join("\n\n");
 
     const args = [
       "--sandbox",
@@ -829,7 +890,7 @@ export class AntigravityAgentSession {
     ];
 
     const child = spawn(command(), args, {
-      cwd: this.cwd,
+      cwd: workspace,
       env: antigravityEnvironment(fakeHome),
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -882,9 +943,27 @@ export class AntigravityAgentSession {
       try {
         const event = JSON.parse(trimmed);
 
-        // P1 Security: Reject any built-in tool execution step reported by AGY
+        // AGY reads an image path through view_file. It may only read the exact
+        // regular files created by this session; every other built-in tool fails.
         const step = record(event.step_update);
-        if (step.tool_call || step.tool_name || step.tool || event.tool_call || event.tool_use || event.tool_calls) {
+        const toolInfo = record(step.tool_info);
+        const toolParameters = record(toolInfo.parameters);
+        const toolPath = toolParameters.AbsolutePath;
+        let allowedImageRead = false;
+        if (
+          step.step_type === "tool" &&
+          step.tool_name === "view_file" &&
+          toolInfo.name === "view_file" &&
+          typeof toolPath === "string"
+        ) {
+          try {
+            allowedImageRead = allowedImagePaths.has(realpathSync(toolPath));
+          } catch {}
+        }
+        if (
+          !allowedImageRead &&
+          (step.tool_call || step.tool_name || step.tool || event.tool_call || event.tool_use || event.tool_calls)
+        ) {
           fail(new Error("Built-in tool execution is disabled in agent bridge"));
           return;
         }
@@ -982,5 +1061,10 @@ export async function closeAntigravitySessions() {
 
 export const runAntigravity: ChatRunner = async (input, options = {}) => {
   const session = await AntigravityAgentSession.create();
-  return session.run(input, options);
+  try {
+    return await session.run(input, options);
+  } catch (error) {
+    await session.close();
+    throw error;
+  }
 };

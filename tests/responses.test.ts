@@ -187,7 +187,7 @@ test("rejects stateful and unsupported requests loudly", () => {
   ).toThrow("Only function tools");
   expect(() => toChatRequest(request({
     input: [{ role: "user", content: [{ type: "input_image", file_id: "file_1" }] }]
-  }))).toThrow("stores no files");
+  }))).toThrow("must be resolved");
   expect(() =>
     toChatRequest(request({ input: [{ type: "item_reference", id: "x" }] }))
   ).toThrow('input item "item_reference"');

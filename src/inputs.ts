@@ -152,7 +152,7 @@ export function pdfSource(input: FileInput) {
     badRequest("PDF input must use exactly one of file_data, file_url, or file_id.");
   }
   if (input.file_id) {
-    badRequest("file_id is not supported: this bridge does not store uploaded files.");
+    badRequest("file_id must be resolved before PDF validation.");
   }
   if (input.file_url) {
     return { type: "url" as const, url: validateRemoteUrl(input.file_url, "file_url") };

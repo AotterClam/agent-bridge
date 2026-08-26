@@ -55,6 +55,12 @@ import {
   validateRemoteUrl,
   type InputCapabilities
 } from "./inputs.js";
+import {
+  createFileStore,
+  fileStorageCapability,
+  materializeChatFileIds,
+  materializeResponseFileIds
+} from "./files.js";
 import { z } from "zod";
 
 export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
@@ -126,6 +132,23 @@ const legacyUnknownImages = () => {
 };
 
 const capabilitiesResponseSchema = z.object({
+  files: z.object({
+    status: z.enum(["supported", "unsupported", "unknown"]),
+    scope: z.string(),
+    persistence: z.string(),
+    max_file_bytes: z.number(),
+    accepted_media_types: z.array(z.string()),
+    resolves_file_id_for: z.array(z.string()).default([]),
+    endpoints: z.array(z.string())
+  }).default({
+    status: "unknown",
+    scope: "unknown",
+    persistence: "File storage capability was not reported by this server",
+    max_file_bytes: 0,
+    accepted_media_types: [],
+    resolves_file_id_for: [],
+    endpoints: []
+  }),
   adapters: z.array(z.object({
     id: z.enum(["claude", "codex", "grok", "antigravity"]),
     name: z.string(),
@@ -301,6 +324,7 @@ export function liteLLMModelInfo(adapter: AdapterCapability) {
       supports_pdf_input: supported(adapter.inputs.pdf.status),
       agent_bridge: {
         adapter_id: adapter.id,
+        files: fileStorageCapability,
         inputs: adapter.inputs,
         images: adapter.images
       }
@@ -368,12 +392,10 @@ function validateInputs(input: z.infer<typeof chatRequestSchema>, capability: Ad
     ["pdf", files]
   ] as const) {
     const cell = capability.inputs[kind];
-    const grokLiveProbe =
-      capability.id === "grok" &&
-      kind === "image" &&
+    const liveProbe =
       cell.status === "unknown" &&
-      cell.provider_capabilities.prompt_json === true;
-    if (values.length && cell.status !== "supported" && !grokLiveProbe) {
+      cell.provider_capabilities.live_probe === true;
+    if (values.length && cell.status !== "supported" && !liveProbe) {
       throw Object.assign(
         new Error(`${capability.id} does not support ${kind} input through this bridge.`),
         { status: 400 }
@@ -432,6 +454,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     options.controlToken ??
     process.env.AGENT_BRIDGE_CONTROL_TOKEN ??
     "local-development-only";
+  const fileStore = createFileStore();
   const tokens = {
     claude: capabilityToken(controlToken, "claude"),
     codex: capabilityToken(controlToken, "codex"),
@@ -509,6 +532,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         });
       }
       return json(response, 200, {
+        files: fileStore.capability,
         adapters: (await capabilities(
           url.searchParams.get("refresh") === "1"
         )).map((adapter) => ({
@@ -526,6 +550,44 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       return json(response, 401, { error: { message: "Invalid API key" } });
     }
     logInfo.adapter = adapter;
+    const filePath = url.pathname.match(/^\/v1\/files\/([^/]+?)(\/content)?$/);
+    if (url.pathname === "/v1/files" || filePath) {
+      try {
+        if (!filePath && request.method === "POST") {
+          return json(response, 200, await fileStore.upload(request, adapter));
+        }
+        if (!filePath && request.method === "GET") {
+          return json(response, 200, {
+            object: "list",
+            data: fileStore.list(adapter),
+            has_more: false
+          });
+        }
+        if (filePath) {
+          const id = decodeURIComponent(filePath[1]!);
+          if (request.method === "GET" && filePath[2]) {
+            const file = await fileStore.read(adapter, id);
+            response.writeHead(200, {
+              "content-type": file.mediaType,
+              "content-length": file.data.length
+            });
+            return response.end(file.data);
+          }
+          if (request.method === "GET") {
+            return json(response, 200, fileStore.get(adapter, id));
+          }
+          if (request.method === "DELETE" && !filePath[2]) {
+            return json(response, 200, await fileStore.delete(adapter, id));
+          }
+        }
+        return json(response, 404, { error: { message: "Not found" } });
+      } catch (error) {
+        logInfo.error = error instanceof Error ? error.message : String(error);
+        return json(response, Number(record(error).status ?? 500), {
+          error: { message: error instanceof Error ? error.message : "Bridge failed" }
+        });
+      }
+    }
     const isResponses =
       request.method === "POST" && url.pathname === "/v1/responses";
     const isImageGeneration =
@@ -643,6 +705,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           (item) => item.id === adapter
         );
         if (!adapterCapability) throw new Error(`${adapter} capability unavailable.`);
+        await materializeResponseFileIds(parsed.data, fileStore, adapter);
         const chatInput = toChatRequest(parsed.data);
         validateInputs(chatInput, adapterCapability);
         const usesImage = parsed.data.tools?.some(
@@ -695,6 +758,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       }
       logInfo.model = parsed.data.model;
       logInfo.stream = Boolean(parsed.data.stream);
+      await materializeChatFileIds(parsed.data, fileStore, adapter);
       const adapterCapability = (await capabilities()).find(
         (item) => item.id === adapter
       );
@@ -734,6 +798,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       await closeCodexSessions();
       await closeGrokSessions();
       await closeAntigravitySessions();
+      await fileStore.close();
       if (server.listening) {
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve()))
@@ -777,7 +842,7 @@ export function createAgentBridgeClient(clientOptions: {
 }) {
   const baseUrl = loopbackBaseUrl(clientOptions.baseUrl);
   const fetcher = clientOptions.fetch ?? globalThis.fetch;
-  const adapters = async (options: { refresh?: boolean } = {}) => {
+  const discovery = async (options: { refresh?: boolean } = {}) => {
     const response = await fetcher(
       `${baseUrl}/capabilities${options.refresh ? "?refresh=1" : ""}`,
       {
@@ -790,9 +855,12 @@ export function createAgentBridgeClient(clientOptions: {
     if (!response.ok) {
       throw new Error(`Agent Bridge returned ${response.status}`);
     }
-    return capabilitiesResponseSchema.parse(await response.json()).adapters;
+    return capabilitiesResponseSchema.parse(await response.json());
   };
+  const adapters = async (options: { refresh?: boolean } = {}) =>
+    (await discovery(options)).adapters;
   return {
+    discovery,
     adapters,
     async connection(id: AdapterId) {
       const adapter = (await adapters()).find((item) => item.id === id);

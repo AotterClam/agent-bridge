@@ -129,10 +129,17 @@ test("reports host input transports without reducing native provider evidence", 
   });
 
   const agy = inputCapabilitiesFromAntigravityProbe(true);
-  expect(agy.image.status).toBe("unsupported");
+  expect(agy.image.status).toBe("unknown");
+  expect(agy.image.supported_openai_content_parts).toEqual([
+    "image_url", "input_image"
+  ]);
   expect(agy.image.provider_capabilities).toMatchObject({
+    live_probe: true,
     native_ui: { image: { status: "supported" } },
-    headless_transport: { media_paths_live_smoke: false }
+    headless_transport: {
+      stream_json_content_blocks: ["text"],
+      image_lane: "print-mode path + scoped view_file"
+    }
   });
 });
 

@@ -341,11 +341,16 @@ POST /v1/chat/completions
 POST /v1/responses
 POST /v1/images/generations
 POST /v1/images/edits
+POST /v1/files
+GET  /v1/files
+GET  /v1/files/{file_id}
+GET  /v1/files/{file_id}/content
+DELETE /v1/files/{file_id}
 ```
 
 Chat completions support standard JSON and SSE streaming responses, OpenAI function-tool calls, and reasoning deltas. The `/v1` routes form the OpenAI-compatible data plane; `/capabilities` uses the separate control token for local discovery.
 
-`/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. Nothing is stored server-side, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
+`/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. No response or item history is stored, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
 ### Image and file inputs
 
@@ -361,9 +366,9 @@ The bridge accepts OpenAI's binary input shapes rather than embedding bytes in a
 | Codex | URL or data URL; `detail=auto/low/high` | base64 WAV or MP3 | No |
 | Claude | URL or data URL; `detail=auto` | No | URL or base64 |
 | Grok | Data URL only; `detail=auto`, no selected tools, prompt JSON at most 192 KiB | No | Not enabled (`embeddedContext` alone is insufficient evidence) |
-| Antigravity | Not through headless mode. Its native TUI accepts image and video attachments, but `stream-json` currently transports text only. | No | No |
+| Antigravity | Data URL only; written to an isolated local path and exposed through an exact-path `read_file` grant; `detail=auto` | No | No |
 
-Because Grok's ACP currently reports `image=false` while its separate `--prompt-json` lane accepts images, discovery starts at `unknown`; the first successful non-streaming image request promotes that cached cell to `supported` for the running bridge.
+Grok and Antigravity image discovery starts at `unknown` where the advertised schema is incomplete; the first successful non-streaming image request promotes that cached cell to `supported` for the running bridge.
 
 ```sh
 curl http://127.0.0.1:3457/v1/responses \
@@ -378,7 +383,20 @@ curl http://127.0.0.1:3457/v1/responses \
   }'
 ```
 
-This is not an arbitrary-file upload service. There is no `/v1/files` storage layer, so `file_id` is rejected. `input_file` currently accepts PDFs only; send text as `input_text`. DOCX, archives, executables, and other opaque binaries are rejected instead of silently converted. OpenAI-compatible clients such as AI SDK and Mastra work when they serialize into these same wire parts; they do not expand the provider capability.
+`POST /v1/files` accepts OpenAI-style multipart uploads and returns a `file_id`. Files are private to the adapter capability token, limited to 20 MiB, kept in a process-local temporary directory, and deleted when the bridge closes. List, metadata, content download, and delete routes are also available. The top-level `files` cell in `/capabilities` reports this lifecycle and the content parts for which the bridge resolves `file_id`.
+
+Any MIME type can be stored and retrieved, but model ingestion is intentionally narrower: `input_image` must still be a valid provider-supported image, and `input_file` currently accepts valid PDFs only on PDF-capable adapters. Uploading a DOCX, archive, executable, or other opaque binary does not imply that a model can understand it.
+
+```sh
+FILE_ID=$(curl -s http://127.0.0.1:3457/v1/files \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -F purpose=vision -F file=@image.png | jq -r .id)
+
+curl http://127.0.0.1:3457/v1/responses \
+  -H "Authorization: Bearer <CAPABILITY_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"<MODEL_ID>\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"file_id\":\"$FILE_ID\"}]}]}"
+```
 
 ### Images compatibility
 
@@ -421,7 +439,7 @@ curl http://127.0.0.1:3457/v1/responses \
 
 `GET /capabilities` probes the CLI executable installed on the user's host. Its real path and version are returned only as a fingerprint; support is determined from the runtime's own capability response or tool catalog, not a version allowlist. Results are cached for the server lifetime; use `GET /capabilities?refresh=1` after changing a CLI installation.
 
-Each input type and image output operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. Input cells expose `supported_openai_content_parts`; image output cells expose LiteLLM's `supported_openai_params`. Both include strict `parameter_constraints` and the underlying runtime's unnormalized `provider_capabilities`, so consumers can use portable OpenAI fields without losing provider-specific controls and caveats.
+Each input type and image output operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. Input cells expose `supported_openai_content_parts`; image output cells expose LiteLLM's `supported_openai_params`. Both include strict `parameter_constraints` and the underlying runtime's unnormalized `provider_capabilities`, so consumers can use portable OpenAI fields without losing provider-specific controls and caveats. The separate top-level `files` cell describes bridge storage rather than pretending it is a native model capability.
 
 Codex currently self-reports image generation support, but its app-server image tool does not expose `size` even though its internal Images client has that field; the bridge reports the host-controllable surface, not a guessed backend maximum. Grok versions without a tool catalog start as `unknown` and are promoted after the first successful live image request. Claude image generation is unsupported. Antigravity's installed executable schema is reported under `provider_capabilities` (including edit/reference inputs and aspect ratios), while bridge execution remains disabled because the CLI does not offer safe single-tool authorization; the bridge does not enable its unrestricted permission bypass.
 

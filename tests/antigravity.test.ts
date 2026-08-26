@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -93,21 +93,24 @@ test("validates Antigravity environment isolation", async () => {
   }
 });
 
-test("prepares isolated home with explicit deny rules and empty MCP", async () => {
+test("prepares isolated home with scoped reads, explicit denies, and empty MCP", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-bridge-home-test-"));
   try {
-    const fakeHome = await prepareIsolatedAntigravityHome(dir);
+    const image = join(dir, "input.png");
+    await writeFile(image, "image");
+    const fakeHome = await prepareIsolatedAntigravityHome(dir, [image]);
     expect(fakeHome).toBe(join(dir, "home"));
 
     const geminiSettings = await Bun.file(join(fakeHome, ".gemini/settings.json")).json();
-    expect(geminiSettings.permissions.auto_approve).toBe(false);
-    expect(geminiSettings.permissions.denied_tools).toEqual(["*"]);
-    expect(geminiSettings.permissions.allow_rules).toEqual([]);
+    expect(geminiSettings.permissions.allow).toEqual([`read_file(${await realpath(image)})`]);
+    expect(geminiSettings.permissions.deny).toContain("command(*)");
+    expect(geminiSettings.permissions.deny).toContain("write_file(*)");
+    expect(geminiSettings.allowNonWorkspaceAccess).toBe(false);
     expect(geminiSettings.tools.enabled).toBe(false);
     expect(geminiSettings.mcp.servers).toEqual({});
 
     const cliSettings = await Bun.file(join(fakeHome, ".gemini/antigravity-cli/settings.json")).json();
-    expect(cliSettings.permissions.denied_tools).toEqual(["*"]);
+    expect(cliSettings.permissions).toEqual(geminiSettings.permissions);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -185,6 +188,7 @@ send({
     usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 }
   }
 });
+
 send({
   event: "step_update",
   step_update: {
@@ -231,6 +235,41 @@ send({
         reasoningTokens: 4
       }
     });
+  } finally {
+    await closeAntigravitySessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND;
+    else process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("writes image input into the isolated AGY print-mode media lane", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-agy-image-test-"));
+  const fakeAgy = join(directory, "agy");
+  const originalCommand = process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND;
+  await writeFile(fakeAgy, `#!/usr/bin/env node
+import { existsSync, readFileSync } from "node:fs";
+const prompt = process.argv[process.argv.indexOf("-p") + 1];
+const path = prompt.match(/Analyze the attached image at (.+?\\.(?:png|jpg|gif|webp))\\./)?.[1];
+if (!path || !existsSync(path) || readFileSync(path).subarray(1, 4).toString("ascii") !== "PNG") process.exit(9);
+const send = (data) => process.stdout.write(JSON.stringify(data) + "\\n");
+send({ event: "step_update", step_update: { step_type: "tool", state: "ACTIVE", tool_name: "view_file", tool_info: { name: "view_file", parameters: { AbsolutePath: path } } } });
+send({ event: "step_update", step_update: { step_type: "tool", state: "DONE", tool_name: "view_file", tool_info: { name: "view_file", parameters: { AbsolutePath: path } } } });
+send({ event: "result", result: { status: "SUCCESS", response: "VISION" } });
+`);
+  await chmod(fakeAgy, 0o755);
+  process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND = fakeAgy;
+  try {
+    expect(await runAntigravity(chatRequestSchema.parse({
+      model: "gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Describe it" },
+          { type: "image_url", image_url: "data:image/png;base64,iVBORw0KGgo=" }
+        ]
+      }]
+    }))).toMatchObject({ content: "VISION", finishReason: "stop" });
   } finally {
     await closeAntigravitySessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_ANTIGRAVITY_COMMAND;
