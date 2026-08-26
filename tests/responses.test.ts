@@ -160,7 +160,7 @@ test("translates OpenAI image and file input parts", () => {
       role: "user",
       content: [
         { type: "input_text", text: "inspect" },
-        { type: "input_image", image_url: "https://example.com/a.png", detail: "high" },
+        { type: "input_image", image_url: "https://example.com/a.png", detail: "original" },
         { type: "input_file", file_data: "JVBERi0=", filename: "a.pdf" }
       ]
     }]
@@ -171,7 +171,7 @@ test("translates OpenAI image and file input parts", () => {
       { type: "text", text: "inspect" },
       {
         type: "image_url",
-        image_url: { url: "https://example.com/a.png", detail: "high" }
+        image_url: { url: "https://example.com/a.png", detail: "original" }
       },
       { type: "file", file: { file_data: "JVBERi0=", filename: "a.pdf" } }
     ]

@@ -338,7 +338,8 @@ async function probeCodexImageCapabilities(
 
 export function inputCapabilitiesFromCodexSchema(
   userInputTypes: string[] | null,
-  error?: string
+  error?: string,
+  imageDetails: string[] = ["auto", "low", "high"]
 ): InputCapabilities {
   const status = (supported: boolean) =>
     userInputTypes === null ? "unknown" as const : supported ? "supported" as const : "unsupported" as const;
@@ -367,7 +368,7 @@ export function inputCapabilitiesFromCodexSchema(
       ["image"],
       ["image_url", "input_image"],
       {
-        detail: { enum: ["auto", "low", "high"] },
+        detail: { enum: imageDetails },
         source: { enum: ["http", "https", "data"] },
         max_decoded_bytes: MAX_INPUT_BYTES
       }
@@ -391,7 +392,12 @@ async function probeCodexInputCapabilities(): Promise<InputCapabilities> {
       { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }
     );
     const schema = JSON.parse(await readFile(join(cwd, "ClientRequest.json"), "utf8"));
-    const userInput = record(record(schema.definitions).UserInput);
+    const definitions = record(schema.definitions);
+    const userInput = record(definitions.UserInput);
+    const imageDetailEnum = record(definitions.ImageDetail).enum;
+    const imageDetails = Array.isArray(imageDetailEnum)
+      ? imageDetailEnum.filter((value: unknown): value is string => typeof value === "string")
+      : [];
     const variants = Array.isArray(userInput.oneOf) ? userInput.oneOf : [];
     const types = variants.flatMap((variant) => {
       const property = record(record(record(variant).properties).type);
@@ -399,7 +405,11 @@ async function probeCodexInputCapabilities(): Promise<InputCapabilities> {
         ? property.enum.filter((value): value is string => typeof value === "string")
         : [];
     });
-    return inputCapabilitiesFromCodexSchema(types);
+    return inputCapabilitiesFromCodexSchema(
+      types,
+      undefined,
+      imageDetails.length ? imageDetails : undefined
+    );
   } catch (error) {
     return inputCapabilitiesFromCodexSchema(
       null,

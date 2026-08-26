@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { closeCodexSessions, runCodexImage } from "../src/codex.js";
 import { createFileStore } from "../src/files.js";
+import { capabilityToken, startAgentBridge } from "../src/index.js";
 import {
   closeGrokSessions,
   grokAspectRatioForSize,
@@ -174,8 +175,7 @@ test("returns a Responses image_generation_call and validates image controls", a
   const input = responsesRequestSchema.parse({
     model: "test",
     input: "draw a clam",
-    tools: [{ type: "image_generation", partial_images: 0, size: "1600x900" }],
-    tool_choice: "required"
+    tools: [{ type: "image_generation", partial_images: 0, size: "1600x900" }]
   });
   const response = await respondResponses(
     input,
@@ -205,9 +205,9 @@ test("returns a Responses image_generation_call and validates image controls", a
   )).rejects.toMatchObject({ status: 400 });
 
   for (const extra of [
-    {},
     { tool_choice: "required", store: true },
-    { tool_choice: "required", instructions: "override the user" }
+    { tool_choice: "required", instructions: "override the user" },
+    { tool_choice: "none" }
   ]) {
     await expect(respondResponses(
       responsesRequestSchema.parse({
@@ -222,6 +222,88 @@ test("returns a Responses image_generation_call and validates image controls", a
     )).rejects.toMatchObject({ status: 400 });
   }
 });
+
+test("routes Responses image_generation through the HTTP data plane", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-responses-image-test-"));
+  const fake = join(directory, "grok");
+  const grokHome = join(directory, "grok-home");
+  const originalCommand = process.env.AGENT_BRIDGE_GROK_COMMAND;
+  const originalHome = process.env.GROK_HOME;
+  await writeFile(fake, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+if (args.includes("--version")) process.stdout.write("grok 1.0.0\\n");
+else if (args.includes("--help")) process.stdout.write("Usage: grok\\n");
+else {
+  const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+  let cwd;
+  createInterface({ input: process.stdin }).on("line", (line) => {
+    const message = JSON.parse(line);
+    if (message.method === "initialize") send({ jsonrpc: "2.0", id: message.id, result: {
+      authMethods: [{ id: "cached_token" }],
+      toolCatalog: ["image_gen", "image_edit"],
+      _meta: { modelState: { availableModels: [{ modelId: "grok-test", name: "Grok Test" }] } }
+    } });
+    else if (message.method === "authenticate") send({ jsonrpc: "2.0", id: message.id, result: {} });
+    else if (message.method === "session/new") {
+      cwd = realpathSync(message.params.cwd);
+      send({ jsonrpc: "2.0", id: message.id, result: { sessionId: "session-image" } });
+    } else if (message.method === "session/prompt") {
+      send({ jsonrpc: "2.0", method: "session/update", params: { update: {
+        sessionUpdate: "tool_call", toolCallId: "call-image", toolName: "image_gen",
+        _meta: { "x.ai/tool": { name: "image_gen" } }
+      } } });
+      send({ jsonrpc: "2.0", id: 77, method: "session/request_permission", params: {
+        toolCall: { toolName: "image_gen", _meta: { "x.ai/tool": { name: "image_gen" } } },
+        options: [{ kind: "allow_once", optionId: "allow-once" }]
+      } });
+    } else if (message.id === 77 && message.result) {
+      const root = join(process.env.GROK_HOME, "sessions", encodeURIComponent(cwd), "session-image", "images");
+      const path = join(root, "result.png");
+      mkdirSync(root, { recursive: true });
+      writeFileSync(path, Buffer.from(${JSON.stringify(png64)}, "base64"));
+      send({ jsonrpc: "2.0", method: "session/update", params: { update: {
+        sessionUpdate: "tool_call_update", toolCallId: "call-image", status: "completed",
+        rawOutput: { path }
+      } } });
+    }
+  });
+}
+`);
+  await chmod(fake, 0o755);
+  process.env.AGENT_BRIDGE_GROK_COMMAND = fake;
+  process.env.GROK_HOME = grokHome;
+  const controlToken = "responses-image-test";
+  const bridge = await startAgentBridge({ controlToken, preloadModels: false });
+  try {
+    const response = await fetch(`${bridge.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${capabilityToken(controlToken, "grok")}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "grok-test",
+        input: "draw a clam",
+        tools: [{ type: "image_generation" }]
+      })
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      object: "response",
+      output: [{ type: "image_generation_call", result: png64 }]
+    });
+  } finally {
+    await bridge.close();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_GROK_COMMAND;
+    else process.env.AGENT_BRIDGE_GROK_COMMAND = originalCommand;
+    if (originalHome == null) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = originalHome;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 20_000);
 
 test("reads only regular images below an owned real path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-owned-image-"));
