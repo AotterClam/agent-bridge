@@ -166,6 +166,13 @@ curl http://127.0.0.1:3457/v1/responses \
   }'
 ```
 
+The `store: false` lane accepts standard stateless reasoning controls,
+including `max_output_tokens` and
+`include: ["reasoning.encrypted_content"]`. Coding-agent runtimes expose
+neither a native output-token cap nor replayable encrypted reasoning state, so
+the bridge applies the token budget through their shared system transcript and
+returns reasoning summaries without fabricating encrypted content.
+
 ### Client SDK connection
 
 Connect to a standalone bridge using the client SDK:

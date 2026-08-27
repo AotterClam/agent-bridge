@@ -61,7 +61,7 @@ export const responsesRequestSchema = z
       .nullish(),
     store: z.boolean().nullish(),
     previous_response_id: z.string().nullish(),
-    max_output_tokens: z.number().nullish(),
+    max_output_tokens: z.number().int().positive().nullish(),
     temperature: z.number().nullish(),
     top_p: z.number().nullish(),
     top_logprobs: z.number().nullish(),
@@ -75,7 +75,7 @@ export const responsesRequestSchema = z
       })
       .passthrough()
       .nullish(),
-    include: z.array(z.unknown()).nullish(),
+    include: z.array(z.string()).nullish(),
     presence_penalty: z.number().nullish(),
     frequency_penalty: z.number().nullish(),
     service_tier: z.string().nullish(),
@@ -158,7 +158,6 @@ function messageContent(
  */
 function unsupportedControl(input: ResponsesRequest) {
   if (input.store) return "store: true";
-  if (input.max_output_tokens != null) return "max_output_tokens";
   if (input.temperature != null) return "temperature";
   if (input.top_p != null) return "top_p";
   if (input.top_logprobs) return "top_logprobs";
@@ -170,7 +169,10 @@ function unsupportedControl(input: ResponsesRequest) {
   }
   const format = input.text?.format?.type;
   if (format && format !== "text") return `text.format: ${format}`;
-  if (input.include?.length) return "include";
+  const include = input.include?.find(
+    (value) => value !== "reasoning.encrypted_content"
+  );
+  if (include) return `include: ${include}`;
   if (input.presence_penalty) return "presence_penalty";
   if (input.frequency_penalty) return "frequency_penalty";
   if (
@@ -200,6 +202,14 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
   const messages: Array<Record<string, unknown>> = [];
   if (input.instructions) {
     messages.push({ role: "system", content: input.instructions });
+  }
+  if (input.max_output_tokens != null) {
+    // ponytail: coding-agent runtimes expose no native output-token cap; use
+    // their shared system transcript until an adapter gains a real control.
+    messages.push({
+      role: "system",
+      content: `Keep the assistant turn within ${input.max_output_tokens} output tokens.`
+    });
   }
   const items =
     typeof input.input === "string"
@@ -322,7 +332,7 @@ function responsePayload(
     error: null,
     incomplete_details: null,
     instructions: context.request.instructions ?? null,
-    max_output_tokens: null,
+    max_output_tokens: context.request.max_output_tokens ?? null,
     max_tool_calls: null,
     model: context.request.model,
     output,
@@ -383,6 +393,9 @@ export async function respondResponses(
     }
     if (input.previous_response_id) {
       badRequest("previous_response_id is not supported: this bridge is stateless.");
+    }
+    if (input.max_output_tokens != null) {
+      badRequest("max_output_tokens is not supported for image_generation.");
     }
     const control = unsupportedControl(input);
     if (control) badRequest(`This bridge does not support ${control}.`);

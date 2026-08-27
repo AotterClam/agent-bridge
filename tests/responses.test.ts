@@ -86,14 +86,13 @@ test("replays function_call items as one assistant message per burst", () => {
 test("rejects controls the adapters cannot honor", () => {
   for (const overrides of [
     { temperature: 0.2 },
-    { max_output_tokens: 100 },
     { top_p: 0.5 },
     { max_tool_calls: 2 },
     { parallel_tool_calls: false },
     { background: true },
     { truncation: "auto" },
     { text: { format: { type: "json_schema", schema: {} } } },
-    { include: ["reasoning.encrypted_content"] },
+    { include: ["message.output_text.logprobs"] },
     { presence_penalty: 0.5 },
     { frequency_penalty: -0.3 },
     { service_tier: "flex" },
@@ -129,6 +128,18 @@ test("rejects controls the adapters cannot honor", () => {
   ).not.toThrow();
 });
 
+test("accepts a standard stateless reasoning request", () => {
+  const chat = toChatRequest(request({
+    store: false,
+    max_output_tokens: 8192,
+    include: ["reasoning.encrypted_content"]
+  }));
+  expect(chat.messages).toContainEqual({
+    role: "system",
+    content: "Keep the assistant turn within 8192 output tokens."
+  });
+});
+
 test("echoes metadata", async () => {
   const runner: ChatRunner = async () => ({
     content: "ok",
@@ -137,12 +148,14 @@ test("echoes metadata", async () => {
   });
   const response = await respondResponses(
     request({
-      metadata: { task: "t-1" }
+      metadata: { task: "t-1" },
+      max_output_tokens: 8192
     }),
     runner
   );
   const payload = (await response.json()) as Record<string, any>;
   expect(payload.metadata).toEqual({ task: "t-1" });
+  expect(payload.max_output_tokens).toBe(8192);
 });
 
 test("tags translation failures as 400s", () => {
@@ -275,7 +288,10 @@ test("streams semantic events across reasoning, text, and tool calls", async () 
     } satisfies ChatTurn;
   };
   const parsed = await events(
-    await respondResponses(request({ stream: true }), runner)
+    await respondResponses(request({
+      stream: true,
+      include: ["reasoning.encrypted_content"]
+    }), runner)
   );
   expect(parsed.map((event) => event.type)).toEqual([
     "response.created",
@@ -310,6 +326,7 @@ test("streams semantic events across reasoning, text, and tool calls", async () 
     "message",
     "function_call"
   ]);
+  expect(completed.response.output[0].encrypted_content).toBeUndefined();
   expect(completed.response.output[1].content[0].text).toBe("hello");
   expect(completed.response.output[2].arguments).toBe('{"q":1}');
 });
