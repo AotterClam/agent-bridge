@@ -207,6 +207,7 @@ test("returns a Responses image_generation_call and validates image controls", a
   for (const extra of [
     {},
     { tool_choice: "required", store: true },
+    { tool_choice: "required", max_output_tokens: 100 },
     { tool_choice: "required", instructions: "override the user" }
   ]) {
     await expect(respondResponses(
