@@ -139,15 +139,10 @@ test("exposes LiteLLM model-info names while retaining bridge-native evidence", 
 });
 
 test("reports host input transports without reducing native provider evidence", () => {
-  const codex = inputCapabilitiesFromCodexSchema(
-    ["text", "image", "localImage", "audio", "localAudio"],
-    undefined,
-    ["auto", "low", "high", "original"]
-  );
+  const codex = inputCapabilitiesFromCodexSchema([
+    "text", "image", "localImage", "audio", "localAudio"
+  ]);
   expect(codex.image.status).toBe("supported");
-  expect(codex.image.parameter_constraints.detail).toEqual({
-    enum: ["auto", "low", "high", "original"]
-  });
   expect(codex.audio.status).toBe("supported");
   expect(codex.pdf.status).toBe("unsupported");
 
