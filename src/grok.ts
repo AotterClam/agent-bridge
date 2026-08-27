@@ -290,6 +290,10 @@ async function discoverGrokModelsViaAcp() {
     }
   );
   const client = rpc(child, () => {});
+  // A missing Grok executable reports ENOENT asynchronously on ChildProcess.
+  // Feed it into the pending ACP request; otherwise the EventEmitter throws
+  // outside detectGrok()'s fail-closed catch and can terminate the host.
+  child.once("error", (error) => client.close(error));
   try {
     const init = await Promise.race([
       client.request("initialize", {
