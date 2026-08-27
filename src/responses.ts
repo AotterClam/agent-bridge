@@ -17,7 +17,7 @@ const partSchema = z
   .object({
     type: z.string(),
     text: z.string().optional(),
-    detail: z.enum(["auto", "low", "high"]).optional(),
+    detail: z.enum(["auto", "low", "high", "original"]).optional(),
     image_url: z.string().optional(),
     file_id: z.string().optional(),
     file_data: z.string().optional(),
@@ -403,16 +403,11 @@ export async function respondResponses(
       badRequest("tool_choice none cannot be used with the image_generation lane.");
     }
     if (
-      input.tool_choice !== "required" &&
-      !(
-        input.tool_choice != null &&
-        typeof input.tool_choice === "object" &&
-        input.tool_choice.type === "image_generation"
-      )
+      input.tool_choice != null &&
+      typeof input.tool_choice === "object" &&
+      input.tool_choice.type !== "image_generation"
     ) {
-      badRequest(
-        "image_generation requires tool_choice required or { type: \"image_generation\" }."
-      );
+      badRequest("image_generation requires an image_generation tool choice.");
     }
     if (typeof input.input !== "string") {
       badRequest("image_generation currently requires a string input.");

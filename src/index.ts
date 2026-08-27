@@ -453,7 +453,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
   const controlToken =
     options.controlToken ??
     process.env.AGENT_BRIDGE_CONTROL_TOKEN ??
-    "local-development-only";
+    randomBytes(32).toString("base64url");
   const fileStore = createFileStore();
   const tokens = {
     claude: capabilityToken(controlToken, "claude"),
@@ -719,11 +719,11 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         );
         if (!adapterCapability) throw new Error(`${adapter} capability unavailable.`);
         await materializeResponseFileIds(parsed.data, fileStore, adapter);
-        const chatInput = toChatRequest(parsed.data);
-        validateInputs(chatInput, adapterCapability);
         const usesImage = parsed.data.tools?.some(
           (tool) => tool.type === "image_generation"
         ) ?? false;
+        const chatInput = usesImage ? undefined : toChatRequest(parsed.data);
+        if (chatInput) validateInputs(chatInput, adapterCapability);
         const capability = usesImage ? adapterCapability : undefined;
         const image =
           usesImage &&
@@ -757,7 +757,9 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           ),
           response
         );
-        if (!parsed.data.stream) markInputSupported(adapterCapability, chatInput);
+        if (!parsed.data.stream && chatInput) {
+          markInputSupported(adapterCapability, chatInput);
+        }
         if (usesImage) {
           markImageSupported(capability, "responsesImageGeneration");
         }

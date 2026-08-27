@@ -68,6 +68,20 @@ Available models:
   ]);
 });
 
+test("fails closed when the Grok ACP discovery executable is missing", async () => {
+  const original = process.env.AGENT_BRIDGE_GROK_COMMAND;
+  process.env.AGENT_BRIDGE_GROK_COMMAND = "/definitely-not-a-real-agent-bridge-grok";
+  try {
+    const detected = await detectGrok();
+    expect(detected.available).toBe(false);
+    expect(detected.models).toEqual([]);
+    expect(detected.error).toContain("ENOENT");
+  } finally {
+    if (original == null) delete process.env.AGENT_BRIDGE_GROK_COMMAND;
+    else process.env.AGENT_BRIDGE_GROK_COMMAND = original;
+  }
+});
+
 test("forwards advertised efforts in arrival order", () => {
   const incoming = [
     { value: "max" },

@@ -7,7 +7,7 @@ const imageUrlPart = z.object({
     z.string(),
     z.object({
       url: z.string(),
-      detail: z.enum(["auto", "low", "high"]).optional()
+      detail: z.enum(["auto", "low", "high", "original"]).optional()
     })
   ])
 });
