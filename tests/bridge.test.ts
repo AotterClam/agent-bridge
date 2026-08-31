@@ -229,19 +229,20 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
 }, 10_000);
 
-test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () => {
-  // The reported case: a zod z.tuple([number, number, number, number]) parameter becomes
-  // a single (anyOf-wrapped) item schema plus min/maxItems pinning the length to 4. Since
-  // every branch is identical, `anyOf` of four `{type:"number"}` schemas validates exactly
-  // the same values as a bare `{type:"number"}` would — just written more verbosely — so
-  // this stays semantically equivalent to the original per-position tuple check collapsed
-  // to "array of exactly 4 numbers".
+test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
+  // The reported case, in the exact shape zod-to-json-schema actually emits for a plain
+  // (non-rest) zod tuple: a same-typed `items` array plus minItems === maxItems ===
+  // items.length. Every position already required the same schema, and the array was
+  // already closed to exactly 4 items, so collapsing to one `items` schema changes
+  // nothing observable — it is not an approximation for this shape.
   expect(toCodexCompatibleSchema({
     type: "object",
     properties: {
       coords: {
         type: "array",
-        items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+        items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }],
+        minItems: 4,
+        maxItems: 4
       }
     }
   })).toEqual({
@@ -249,59 +250,49 @@ test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () 
     properties: {
       coords: {
         type: "array",
-        items: {
-          anyOf: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
-        },
+        items: { type: "number" },
         minItems: 4,
         maxItems: 4
       }
     }
   });
 
-  // Mixed-type tuple items collapse into anyOf instead of silently picking one branch.
+  // The other schema-author idiom for a closed tuple: additionalItems: false instead of
+  // an explicit maxItems. additionalItems is dropped from the output — once items/min/max
+  // pin the array to exactly 2, "no additional items" is already implied and vacuous.
   expect(toCodexCompatibleSchema({
     type: "array",
-    items: [{ type: "string" }, { type: "number" }]
+    items: [{ type: "boolean" }, { type: "boolean" }],
+    minItems: 2,
+    additionalItems: false
   })).toEqual({
     type: "array",
-    items: { anyOf: [{ type: "string" }, { type: "number" }] },
+    items: { type: "boolean" },
     minItems: 2,
     maxItems: 2
   });
 
-  // A schema author's explicit minItems/maxItems is preserved rather than overwritten.
+  // A single-element pinned tuple collapses the same way.
   expect(toCodexCompatibleSchema({
     type: "array",
-    items: [{ type: "number" }, { type: "number" }],
-    minItems: 0,
-    maxItems: 4
+    items: [{ type: "string" }],
+    minItems: 1,
+    maxItems: 1
   })).toEqual({
     type: "array",
-    items: { anyOf: [{ type: "number" }, { type: "number" }] },
-    minItems: 0,
-    maxItems: 4
-  });
-
-  // A single-element tuple still collapses (no anyOf of one).
-  expect(toCodexCompatibleSchema({
-    type: "array",
-    items: [{ type: "boolean" }]
-  })).toEqual({
-    type: "array",
-    items: { type: "boolean" },
+    items: { type: "string" },
     minItems: 1,
     maxItems: 1
   });
 
-  // Non-tuple (already-single) `items` schemas, and nesting inside properties/anyOf/arrays,
-  // pass through recursively unchanged in shape.
+  // Nesting: a pinned tuple inside `properties`/`anyOf` still collapses recursively.
   expect(toCodexCompatibleSchema({
     type: "object",
     properties: {
       tags: { type: "array", items: { type: "string" } },
-      variants: {
+      score: {
         anyOf: [
-          { type: "array", items: [{ type: "number" }, { type: "string" }] },
+          { type: "array", items: [{ type: "number" }, { type: "number" }], minItems: 2, maxItems: 2 },
           { type: "null" }
         ]
       }
@@ -311,14 +302,9 @@ test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () 
     type: "object",
     properties: {
       tags: { type: "array", items: { type: "string" } },
-      variants: {
+      score: {
         anyOf: [
-          {
-            type: "array",
-            items: { anyOf: [{ type: "number" }, { type: "string" }] },
-            minItems: 2,
-            maxItems: 2
-          },
+          { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
           { type: "null" }
         ]
       }
@@ -326,7 +312,8 @@ test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () 
     required: ["tags"]
   });
 
-  // Scalars, null, and bare arrays/tuples-of-primitives pass through untouched.
+  // Non-tuple (already-single) `items` schemas, scalars, null, and bare arrays pass
+  // through unchanged — there is nothing tuple-shaped to reject or rewrite.
   expect(toCodexCompatibleSchema("string")).toBe("string");
   expect(toCodexCompatibleSchema(null)).toBeNull();
   expect(toCodexCompatibleSchema(undefined)).toBeUndefined();
@@ -335,13 +322,129 @@ test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () 
     .toEqual({ type: "object", properties: {} });
 });
 
-test("sends a codex-compatible dynamicTools schema over the wire for tuple-form tool parameters", async () => {
+test("fails fast instead of guessing at a tuple rewrite that isn't provably safe", () => {
+  // Heterogeneous tuple, even though its length is pinned: a positional contract
+  // (position 0 is a string, position 1 is a number) cannot be collapsed to one shared
+  // schema without changing meaning. The old `anyOf`-based rewrite would have produced
+  // `items: { anyOf: [{type:"string"},{type:"number"}] }`, which — unlike the original
+  // tuple — accepts the reversed order `[<number>, <string>]` because `anyOf` applies
+  // independently to every position. That silent acceptance is exactly what must not
+  // happen, so this now throws instead of emitting that schema.
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "string" }, { type: "number" }],
+    minItems: 2,
+    maxItems: 2
+  })).toThrow('tuple-form "items"');
+
+  // Homogeneous but open-length: without minItems/maxItems/additionalItems, positions
+  // beyond the tuple are legal and unconstrained in the original schema. Pinning
+  // minItems/maxItems here (the old behavior) would reject previously-valid extra
+  // elements, so this is rejected rather than guessed at.
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }]
+  })).toThrow('tuple-form "items"');
+
+  // Homogeneous but only upper-bounded (minItems does not match the tuple length): the
+  // array may legitimately be shorter than the tuple, which is a different contract than
+  // "exactly length items."
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 0,
+    maxItems: 2
+  })).toThrow('tuple-form "items"');
+
+  // additionalItems as a schema (zod's `.tuple([...]).rest(...)`, which zod-to-json-schema
+  // renders as `items` + `minItems` + `additionalItems: <schema>`, no maxItems) is not one
+  // of the two provably-safe shapes either.
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 2,
+    additionalItems: { type: "string" }
+  })).toThrow('tuple-form "items"');
+
+  // The error surfaces through recursion: a nested unsafe tuple fails the whole schema,
+  // not just the inner fragment.
+  expect(() => toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      coords: { type: "array", items: [{ type: "string" }, { type: "number" }] }
+    }
+  })).toThrow('tuple-form "items"');
+});
+
+test("names the offending tool and never dispatches an unsupported schema to codex app-server", async () => {
+  // Regression test for the review finding on the first version of this fix: a
+  // heterogeneous or open-ended tuple must fail the turn locally — naming the tool —
+  // instead of either being silently mistranslated or forwarded to codex app-server.
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
+  const fakeCodex = join(directory, "codex");
+  const capturedThreadStart = join(directory, "thread-start.json");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "thread/start") {
+    writeFileSync(${JSON.stringify(capturedThreadStart)}, JSON.stringify(message.params));
+    send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+
+  try {
+    let caught: unknown;
+    try {
+      await runCodex(chatRequestSchema.parse({
+        model: "test",
+        messages: [{ role: "user", content: "set the region" }],
+        tools: [{
+          type: "function",
+          function: {
+            name: "set_media_region",
+            parameters: {
+              type: "object",
+              properties: {
+                coords: { type: "array", items: [{ type: "string" }, { type: "number" }] }
+              }
+            }
+          }
+        }]
+      }));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('Codex tool "set_media_region"');
+    expect((caught as Error).message).toContain("unsupported parameter schema");
+
+    // The capture file is only ever written by the fake codex's thread/start handler, so
+    // its absence proves the request never reached the app-server RPC layer.
+    await expect(readFile(capturedThreadStart, "utf8")).rejects.toThrow();
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("sends a codex-compatible dynamicTools schema over the wire for a length-pinned tuple", async () => {
   // Regression test for: codex app-server rejected the whole thread/start request with
   // `dynamic tool input schema is not supported for set_media_region: invalid type: map,
   // expected a string` whenever a tool's JSON Schema used tuple-form `items` (an array of
-  // per-position schemas). This spawns a fake codex that captures the raw thread/start
-  // params to a file, so the assertion covers what actually goes out over the app-server
-  // RPC wire — not just the pure toCodexCompatibleSchema unit above.
+  // per-position schemas) — the exact shape zod-to-json-schema emits for a plain zod
+  // tuple. This spawns a fake codex that captures the raw thread/start params to a file,
+  // so the assertion covers what actually goes out over the app-server RPC wire — not
+  // just the pure toCodexCompatibleSchema unit above.
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
   const fakeCodex = join(directory, "codex");
   const capturedThreadStart = join(directory, "thread-start.json");
@@ -384,7 +487,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
                   { type: "number" },
                   { type: "number" },
                   { type: "number" }
-                ]
+                ],
+                minItems: 4,
+                maxItems: 4
               }
             }
           }
@@ -402,9 +507,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         properties: {
           coords: {
             type: "array",
-            items: {
-              anyOf: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
-            },
+            items: { type: "number" },
             minItems: 4,
             maxItems: 4
           }
