@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,7 +8,8 @@ import {
   codexTurnTimeoutMs,
   completedCodexTurn,
   recoverTextToolCall,
-  runCodex
+  runCodex,
+  toCodexCompatibleSchema
 } from "../src/codex.js";
 import {
   chatRequestSchema,
@@ -220,6 +221,196 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         ]
       }]
     }))).toMatchObject({ content: "vision", finishReason: "stop" });
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("rewrites tuple-form JSON Schema items into a codex-compatible schema", () => {
+  // The reported case: a zod z.tuple([number, number, number, number]) parameter becomes
+  // a single (anyOf-wrapped) item schema plus min/maxItems pinning the length to 4. Since
+  // every branch is identical, `anyOf` of four `{type:"number"}` schemas validates exactly
+  // the same values as a bare `{type:"number"}` would — just written more verbosely — so
+  // this stays semantically equivalent to the original per-position tuple check collapsed
+  // to "array of exactly 4 numbers".
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      coords: {
+        type: "array",
+        items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+      }
+    }
+  })).toEqual({
+    type: "object",
+    properties: {
+      coords: {
+        type: "array",
+        items: {
+          anyOf: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+        },
+        minItems: 4,
+        maxItems: 4
+      }
+    }
+  });
+
+  // Mixed-type tuple items collapse into anyOf instead of silently picking one branch.
+  expect(toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "string" }, { type: "number" }]
+  })).toEqual({
+    type: "array",
+    items: { anyOf: [{ type: "string" }, { type: "number" }] },
+    minItems: 2,
+    maxItems: 2
+  });
+
+  // A schema author's explicit minItems/maxItems is preserved rather than overwritten.
+  expect(toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 0,
+    maxItems: 4
+  })).toEqual({
+    type: "array",
+    items: { anyOf: [{ type: "number" }, { type: "number" }] },
+    minItems: 0,
+    maxItems: 4
+  });
+
+  // A single-element tuple still collapses (no anyOf of one).
+  expect(toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "boolean" }]
+  })).toEqual({
+    type: "array",
+    items: { type: "boolean" },
+    minItems: 1,
+    maxItems: 1
+  });
+
+  // Non-tuple (already-single) `items` schemas, and nesting inside properties/anyOf/arrays,
+  // pass through recursively unchanged in shape.
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      tags: { type: "array", items: { type: "string" } },
+      variants: {
+        anyOf: [
+          { type: "array", items: [{ type: "number" }, { type: "string" }] },
+          { type: "null" }
+        ]
+      }
+    },
+    required: ["tags"]
+  })).toEqual({
+    type: "object",
+    properties: {
+      tags: { type: "array", items: { type: "string" } },
+      variants: {
+        anyOf: [
+          {
+            type: "array",
+            items: { anyOf: [{ type: "number" }, { type: "string" }] },
+            minItems: 2,
+            maxItems: 2
+          },
+          { type: "null" }
+        ]
+      }
+    },
+    required: ["tags"]
+  });
+
+  // Scalars, null, and bare arrays/tuples-of-primitives pass through untouched.
+  expect(toCodexCompatibleSchema("string")).toBe("string");
+  expect(toCodexCompatibleSchema(null)).toBeNull();
+  expect(toCodexCompatibleSchema(undefined)).toBeUndefined();
+  expect(toCodexCompatibleSchema([1, 2, 3])).toEqual([1, 2, 3]);
+  expect(toCodexCompatibleSchema({ type: "object", properties: {} }))
+    .toEqual({ type: "object", properties: {} });
+});
+
+test("sends a codex-compatible dynamicTools schema over the wire for tuple-form tool parameters", async () => {
+  // Regression test for: codex app-server rejected the whole thread/start request with
+  // `dynamic tool input schema is not supported for set_media_region: invalid type: map,
+  // expected a string` whenever a tool's JSON Schema used tuple-form `items` (an array of
+  // per-position schemas). This spawns a fake codex that captures the raw thread/start
+  // params to a file, so the assertion covers what actually goes out over the app-server
+  // RPC wire — not just the pure toCodexCompatibleSchema unit above.
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
+  const fakeCodex = join(directory, "codex");
+  const capturedThreadStart = join(directory, "thread-start.json");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "thread/start") {
+    writeFileSync(${JSON.stringify(capturedThreadStart)}, JSON.stringify(message.params));
+    send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1" } } });
+    send({ method: "item/agentMessage/delta", params: { delta: "done" } });
+    send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+
+  try {
+    await runCodex(chatRequestSchema.parse({
+      model: "test",
+      messages: [{ role: "user", content: "set the region" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "set_media_region",
+          parameters: {
+            type: "object",
+            properties: {
+              coords: {
+                type: "array",
+                items: [
+                  { type: "number" },
+                  { type: "number" },
+                  { type: "number" },
+                  { type: "number" }
+                ]
+              }
+            }
+          }
+        }
+      }]
+    }));
+
+    const params = JSON.parse(await readFile(capturedThreadStart, "utf8"));
+    expect(params.dynamicTools).toEqual([{
+      type: "function",
+      name: "set_media_region",
+      description: "",
+      inputSchema: {
+        type: "object",
+        properties: {
+          coords: {
+            type: "array",
+            items: {
+              anyOf: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+            },
+            minItems: 4,
+            maxItems: 4
+          }
+        }
+      }
+    }]);
   } finally {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;

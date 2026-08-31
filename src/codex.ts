@@ -50,6 +50,48 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/**
+ * codex app-server's dynamicTools inputSchema parser (Rust/serde) does not accept the
+ * JSON Schema "tuple" form of `items` — an array of one schema per position, as zod's
+ * `z.tuple([...])` produces. Sent verbatim, thread/start rejects the whole request with
+ * `dynamic tool input schema is not supported for <tool>: invalid type: map, expected a
+ * string` (root-caused against a live app-server by bisecting the schema; not a guess).
+ * No other adapter needs this: Claude's path (claude-bridge.mjs `toolShape`) converts
+ * the same JSON Schema through zod's `fromJSONSchema`, which has explicit draft-7 tuple
+ * support, before handing tools to claude-agent-sdk's in-process MCP server; and the
+ * OpenAI-compatible /chat/completions and /responses surfaces never validate `parameters`
+ * beyond "is it an object" (see protocol.ts's chatRequestSchema). So this rewrite is
+ * scoped to the Codex wire format only, not the shared ChatRequest tool schema.
+ *
+ * Recursively walk the schema and rewrite a tuple-form `items` into a single schema
+ * (multiple distinct item schemas collapse into `anyOf`) plus `minItems`/`maxItems` to
+ * pin the array length. This is semantically close for the common case — a fixed-length
+ * tuple of same-typed elements — trading positional type-checking for a length check
+ * plus a per-element type check. Same fix already shipped and field-verified against a
+ * live codex app-server in loomlore's own Codex runtime (`toCodexCompatibleSchema`)
+ * before landing here.
+ */
+export function toCodexCompatibleSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(toCodexCompatibleSchema);
+  if (!schema || typeof schema !== "object") return schema;
+  const obj = schema as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === "items") continue; // handled below: may be a tuple (array) or a single schema.
+    out[key] = toCodexCompatibleSchema(value);
+  }
+  const items = obj.items;
+  if (Array.isArray(items)) {
+    const converted = items.map(toCodexCompatibleSchema);
+    out.items = converted.length === 1 ? converted[0] : { anyOf: converted };
+    if (out.minItems === undefined) out.minItems = items.length;
+    if (out.maxItems === undefined) out.maxItems = items.length;
+  } else if (items !== undefined) {
+    out.items = toCodexCompatibleSchema(items);
+  }
+  return out;
+}
+
 function command() {
   return resolveCommand(process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex");
 }
@@ -588,7 +630,7 @@ class CodexSession {
         type: "function",
         name: tool.name,
         description: tool.description ?? "",
-        inputSchema: tool.parameters ?? { type: "object", properties: {} }
+        inputSchema: toCodexCompatibleSchema(tool.parameters ?? { type: "object", properties: {} })
       })),
       baseInstructions: HOST_TOOL_INSTRUCTIONS
     }));
