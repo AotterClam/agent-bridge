@@ -514,10 +514,50 @@ curl -X POST -H "Authorization: Bearer <CONTROL_TOKEN>" \
 
 A second start for an adapter that is already reconnecting returns `409`. An
 adapter with no scriptable login returns `400` with category `unsupported`.
-Unlike the OpenAI-compatible `/v1` lane, control-plane errors carry
-`{"error":{"message":…,"category":…}}`, where category is one of
-`unsupported`, `conflict`, `invalid_request`, `not_found`, `unauthorized`, or
-`server_error`.
+
+### Error categories
+
+Every bridge error — control plane, `/v1` JSON, and both streaming lanes —
+carries `error.category`, a provider-neutral classification a host can switch
+on instead of pattern-matching a runtime's error prose:
+
+`auth_required`, `unsupported`, `conflict`, `invalid_request`, `not_found`,
+`unauthorized`, `server_error`.
+
+`/v1/responses` keeps its OpenAI `error.code` unchanged and adds `category`
+beside it.
+
+### From a failed turn to `authState`
+
+A credential expires on the provider's clock. Nothing tells the bridge, so the
+first thing that observes it is a turn that fails. When an adapter turn fails,
+the bridge discards that adapter's cached sign-in reading and re-probes; if the
+probe confirms the runtime is signed out, the failure is reported as `401` with
+category `auth_required`, and the adapter reads `auth_required` in the very
+next `/capabilities` — no `refresh=1` needed.
+
+```jsonc
+// POST /v1/chat/completions, credential expired
+// HTTP 401
+{"error": {"message": "…", "category": "auth_required"}}
+```
+
+Streaming has already sent its status line by then, so the same category rides
+the existing stream terminators: `{"error":{"message":…,"category":…}}` in the
+chat SSE lane, and the `response.failed` event's error object on
+`/v1/responses`.
+
+Two deliberate limits. A request the bridge itself rejected (any `4xx` — a
+malformed body, an unsupported input) is not evidence about credentials: it
+never re-probes and never claims `auth_required`. And an adapter with no probe
+(`actions: []`) stays `ready`, because the bridge will not assert a sign-in
+problem it has no way to observe.
+
+Cached readings are invalidated by every signal that can change them:
+`refresh=1`, a reconnect settling either way, a failed turn, and age — a
+reading older than 60 seconds is re-probed, so a host that polls
+`/capabilities` without running turns still converges. Concurrent failures and
+concurrent discovery share one probe rather than each spawning a CLI.
 
 The client SDK exposes the same three calls:
 

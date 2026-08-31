@@ -414,6 +414,30 @@ function notFound() {
   });
 }
 
+/**
+ * The bridge's provider-neutral error classification, carried as
+ * `error.category` on every control-plane and data-plane failure and on both
+ * streaming lanes. Hosts switch on this instead of parsing a runtime's error
+ * prose, which is the point of the reconnect contract: `auth_required` means
+ * "this adapter's sign-in died, offer the reconnect action".
+ *
+ * The set is closed and consumed downstream — extend it deliberately.
+ */
+const CATEGORY_BY_STATUS: Record<number, string> = {
+  400: "invalid_request",
+  401: "unauthorized",
+  404: "not_found",
+  409: "conflict",
+  413: "invalid_request"
+};
+
+function errorCategory(error: unknown, status: number) {
+  const explicit = record(error).category;
+  return typeof explicit === "string"
+    ? explicit
+    : CATEGORY_BY_STATUS[status] ?? "server_error";
+}
+
 const runClaude = createClaudeRunner() as ChatRunner & { close(): void };
 
 function validateInputs(input: z.infer<typeof chatRequestSchema>, capability: AdapterCapability) {
@@ -530,6 +554,36 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       options.reconnect?.onEvent?.(event);
     }
   });
+  /**
+   * Turns a failed adapter turn into a classified error.
+   *
+   * Expiry is only ever observed as a turn that failed, so this is where the
+   * cached sign-in reading has to be discarded. When the re-probe confirms the
+   * runtime is signed out, the failure is reported as `401` with category
+   * `auth_required`, which is the same standard field the control plane uses —
+   * a host reads one field instead of pattern-matching a runtime's error prose.
+   */
+  const classifyTurnFailure = async (adapterId: AdapterId, error: unknown) => {
+    const failure = error instanceof Error ? error : new Error("Bridge failed");
+    // Already classified (both the streaming wrapper and the request catch run
+    // this), or rejected by the bridge before the runtime ever saw it — a
+    // malformed body is not evidence about credentials and must not spawn a CLI.
+    const status = Number(record(error).status ?? 0);
+    if (record(error).category || (status >= 400 && status < 500)) return failure;
+    const { authState } = await reconnect.recheck(adapterId);
+    if (authState !== "auth_required") return failure;
+    return Object.assign(failure, { status: 401, category: "auth_required" });
+  };
+  const guardedRunner = (adapterId: AdapterId, run: ChatRunner): ChatRunner =>
+    async (input, runOptions) => {
+      try {
+        return await run(input, runOptions);
+      } catch (error) {
+        // Streaming lanes settle their own errors inside the SSE body and
+        // never reach the request catch, so classification happens here too.
+        throw await classifyTurnFailure(adapterId, error);
+      }
+    };
   const markImageSupported = (
     capability: AdapterCapability | undefined,
     operation: "generation" | "edit" | "responsesImageGeneration"
@@ -643,11 +697,12 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         throw notFound();
       } catch (error) {
         logInfo.error = error instanceof Error ? error.message : String(error);
-        return json(response, Number(record(error).status ?? 500), {
+        const status = Number(record(error).status ?? 500);
+        return json(response, status, {
           error: {
             message:
               error instanceof Error ? error.message : "Reconnect failed",
-            category: String(record(error).category ?? "server_error")
+            category: errorCategory(error, status)
           }
         });
       }
@@ -658,7 +713,9 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       ([, value]) => value === bearer
     )?.[0];
     if (!adapter) {
-      return json(response, 401, { error: { message: "Invalid API key" } });
+      return json(response, 401, {
+        error: { message: "Invalid API key", category: "unauthorized" }
+      });
     }
     logInfo.adapter = adapter;
     const filePath = url.pathname.match(/^\/v1\/files\/([^/]+?)(\/content)?$/);
@@ -694,8 +751,12 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         return json(response, 404, { error: { message: "Not found" } });
       } catch (error) {
         logInfo.error = error instanceof Error ? error.message : String(error);
-        return json(response, Number(record(error).status ?? 500), {
-          error: { message: error instanceof Error ? error.message : "Bridge failed" }
+        const status = Number(record(error).status ?? 500);
+        return json(response, status, {
+          error: {
+            message: error instanceof Error ? error.message : "Bridge failed",
+            category: errorCategory(error, status)
+          }
         });
       }
     }
@@ -714,6 +775,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           : adapter === "antigravity"
             ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined }
             : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage };
+    const runTurn = guardedRunner(adapter, runtime.run);
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -862,7 +924,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         await pipe(
           await respondResponses(
             parsed.data,
-            runtime.run,
+            runTurn,
             controller.signal,
             image
           ),
@@ -891,17 +953,19 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       if (!adapterCapability) throw new Error(`${adapter} capability unavailable.`);
       validateInputs(parsed.data, adapterCapability);
       await pipe(
-        await respond(parsed.data, runtime.run, controller.signal),
+        await respond(parsed.data, runTurn, controller.signal),
         response
       );
       if (!parsed.data.stream) markInputSupported(adapterCapability, parsed.data);
     } catch (error) {
-      logInfo.error = error instanceof Error ? error.message : String(error);
+      const classified = await classifyTurnFailure(adapter, error);
+      logInfo.error = classified.message;
       if (response.headersSent) return response.end();
-      const status = Number(record(error).status ?? 500);
+      const status = Number(record(classified).status ?? 500);
       json(response, status, {
         error: {
-          message: error instanceof Error ? error.message : "Bridge failed"
+          message: classified.message,
+          category: errorCategory(classified, status)
         }
       });
     }

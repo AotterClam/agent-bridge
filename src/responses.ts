@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   chatRequestSchema,
+  errorPayload,
   type ChatDelta,
   type ChatRequest,
   type ChatRunner,
@@ -696,11 +697,9 @@ export async function respondResponses(
             response: {
               ...responsePayload(context, "in_progress", output),
               status: "failed",
-              error: {
-                code: "server_error",
-                message:
-                  error instanceof Error ? error.message : "Bridge failed"
-              }
+              // `code` keeps its OpenAI meaning; `category` is the bridge's
+              // own standard classification, identical across every lane.
+              error: { code: "server_error", ...errorPayload(error) }
             }
           });
         })

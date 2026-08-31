@@ -10,6 +10,14 @@ const exec = promisify(execFile);
 
 const DEFAULT_RECONNECT_TIMEOUT_MS = 300_000;
 const AUTH_PROBE_TIMEOUT_MS = 15_000;
+/**
+ * How long a probe reading stays good without another signal. Sign-in expires
+ * on the provider's clock, not on any event this bridge can observe, so a
+ * cached `ready` that expires only on an explicit refresh is a reading that
+ * can be wrong forever. Short enough that a host polling `/capabilities`
+ * notices on its own, long enough that polling does not spawn a CLI per call.
+ */
+const DEFAULT_PROBE_TTL_MS = 60_000;
 
 /**
  * Provider-neutral sign-in contract.
@@ -244,6 +252,7 @@ export function createReconnectManager(
   options: {
     support?: Partial<Record<AdapterId, AuthSupport>>;
     timeoutMs?: () => number;
+    probeTtlMs?: () => number;
     onEvent?: (event: {
       adapter: AdapterId;
       reconnectId: string;
@@ -253,9 +262,39 @@ export function createReconnectManager(
 ) {
   const support = options.support ?? authSupport;
   const timeout = options.timeoutMs ?? reconnectTimeoutMs;
+  const probeTtl = options.probeTtlMs ?? (() => DEFAULT_PROBE_TTL_MS);
   const runs = new Map<string, ActiveRun>();
   const active = new Map<AdapterId, string>();
-  const probed = new Map<AdapterId, AuthProbeResult>();
+  /**
+   * Cached sign-in readings, invalidated by every signal that can change them:
+   *
+   * - `GET /capabilities?refresh=1` — the host explicitly asks to re-detect.
+   * - A reconnect settling, either way — `settle()` drops the reading, because
+   *   a login can leave the runtime signed in or still signed out.
+   * - A data-plane turn failing — `recheck()` from the turn lane. This is the
+   *   signal that matters in practice: expiry is discovered by the failure it
+   *   causes, and a host must not have to parse a runtime error string to
+   *   learn that its credential died.
+   * - Age — a reading older than `probeTtlMs` is re-probed, so a host that
+   *   polls `/capabilities` without running turns still converges.
+   *
+   * Reconnect *start* needs no entry here: `active` short-circuits the cache
+   * to `reauth_pending` for as long as a login runs. Process restart needs no
+   * entry either — a new process gets an empty map.
+   */
+  const probed = new Map<AdapterId, { result: AuthProbeResult; at: number }>();
+  // Concurrent failures and concurrent discovery must not each spawn a CLI.
+  const inFlight = new Map<AdapterId, Promise<AuthProbeResult>>();
+
+  const probe = (adapter: AdapterId, capability: AuthSupport) => {
+    const running = inFlight.get(adapter);
+    if (running) return running;
+    const started = capability
+      .probe()
+      .finally(() => inFlight.delete(adapter));
+    inFlight.set(adapter, started);
+    return started;
+  };
 
   const view = (run: ActiveRun): ReconnectRun => ({
     reconnectId: run.reconnectId,
@@ -282,16 +321,31 @@ export function createReconnectManager(
   return {
     /** Cached sign-in state, with an in-flight login taking precedence. */
     async authState(adapter: AdapterId): Promise<AdapterAuth> {
-      const actions: AdapterAction[] = support[adapter] ? ["reconnect"] : [];
       const capability = support[adapter];
+      const actions: AdapterAction[] = capability ? ["reconnect"] : [];
       if (!capability) return { authState: "ready", actions };
       if (active.has(adapter)) return { authState: "reauth_pending", actions };
-      const cached = probed.get(adapter) ?? (await capability.probe());
-      probed.set(adapter, cached);
+      const entry = probed.get(adapter);
+      const fresh =
+        entry && Date.now() - entry.at < probeTtl() ? entry.result : undefined;
+      const result = fresh ?? (await probe(adapter, capability));
+      if (!fresh) probed.set(adapter, { result, at: Date.now() });
       // A login that started while the probe was running wins: the probe read
       // the pre-login credential and is already stale.
       if (active.has(adapter)) return { authState: "reauth_pending", actions };
-      return { authState: cached.state, actions };
+      return { authState: result.state, actions };
+    },
+
+    /**
+     * Discards the cached reading and re-probes now. The turn lane calls this
+     * when an adapter fails, so an expired credential is reported as
+     * `auth_required` instead of leaving a host to guess from an error string.
+     * Adapters with no probe answer `ready` unchanged — the bridge cannot
+     * confirm a sign-in problem it has no way to observe.
+     */
+    async recheck(adapter: AdapterId): Promise<AdapterAuth> {
+      probed.delete(adapter);
+      return this.authState(adapter);
     },
 
     /** Drops cached probe readings so the next `authState` re-runs them. */
@@ -346,6 +400,7 @@ export function createReconnectManager(
       runs.clear();
       active.clear();
       probed.clear();
+      inFlight.clear();
     }
   };
 }

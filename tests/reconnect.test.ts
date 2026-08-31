@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   authSupport,
+  capabilityToken,
   createAgentBridge,
   listen,
   parseClaudeAuthStatus,
@@ -12,6 +13,7 @@ import {
   runLogin,
   type AuthSupport
 } from "../src/index.js";
+import { closeCodexSessions } from "../src/codex.js";
 
 /**
  * The fake adapter is a real child process launched through the production
@@ -63,6 +65,8 @@ setInterval(() => {}, 1_000);
     setMode(next: "succeed" | "fail" | "hang" | "exit-zero-without-signin") {
       mode = next;
     },
+    signIn: () => writeFile(marker, "ok"),
+    signOut: () => unlink(marker).catch(() => {}),
     async pid() {
       for (let attempt = 0; attempt < 200; attempt++) {
         if (existsSync(pidFile)) return Number(readFileSync(pidFile, "utf8"));
@@ -78,17 +82,79 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
 });
 
-async function harness(options: { timeoutMs?: () => number } = {}) {
+/**
+ * A Codex app-server stand-in whose turns always fail, so the data-plane
+ * failure path can be exercised without a real runtime or a real credential.
+ */
+async function fakeCodexRuntime(directory: string) {
+  const script = join(directory, "fake-codex.mjs");
+  await writeFile(
+    script,
+    `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const args = process.argv.slice(2);
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+if (args[0] === "--version") {
+  process.stdout.write("codex-cli 0.0.0-test\\n");
+} else if (args[0] === "debug" || args[0] === "models") {
+  process.stdout.write(JSON.stringify({
+    models: [{ slug: "gpt-test", display_name: "GPT Test", visibility: "list" }]
+  }));
+} else if (args.includes("generate-json-schema")) {
+  process.exit(0);
+} else {
+  createInterface({ input: process.stdin }).on("line", (line) => {
+    const message = JSON.parse(line);
+    if (message.method === "initialize") send({ id: message.id, result: {} });
+    else if (message.method === "modelProvider/capabilities/read") {
+      send({ id: message.id, result: { imageGeneration: false } });
+    } else if (message.method === "thread/start") {
+      send({ id: message.id, result: { thread: { id: "thread-1" } } });
+    } else if (message.method === "turn/start") {
+      send({ id: message.id, result: { turn: { id: "turn-1" } } });
+      send({ method: "turn/completed", params: { turn: {
+        status: "failed",
+        error: { message: "stream error: unauthorized" }
+      } } });
+    } else if (message.id != null) send({ id: message.id, result: {} });
+  });
+}
+`
+  );
+  await chmod(script, 0o755);
+  return script;
+}
+
+async function harness(
+  options: {
+    timeoutMs?: () => number;
+    probeTtlMs?: () => number;
+    codexRuntime?: boolean;
+  } = {}
+) {
   const directory = await mkdtemp(join(tmpdir(), "agent-bridge-reconnect-"));
   const fake = await fakeLogin(directory);
   const controlToken = "reconnect-test";
+  if (options.codexRuntime) {
+    const original = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    process.env.AGENT_BRIDGE_CODEX_COMMAND = await fakeCodexRuntime(directory);
+    cleanups.push(async () => {
+      await closeCodexSessions();
+      if (original == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+      else process.env.AGENT_BRIDGE_CODEX_COMMAND = original;
+    });
+  }
   const bridge = createAgentBridge({
     controlToken,
     preloadModels: false,
     logger: { level: "silent" },
     // Only Codex is wired to the fake; Grok keeps the production shape of an
     // adapter with no scriptable login.
-    reconnect: { support: { codex: fake.support }, timeoutMs: options.timeoutMs }
+    reconnect: {
+      support: { codex: fake.support },
+      timeoutMs: options.timeoutMs,
+      probeTtlMs: options.probeTtlMs
+    }
   });
   await listen(bridge, 0);
   const address = bridge.server.address();
@@ -108,7 +174,22 @@ async function harness(options: { timeoutMs?: () => number } = {}) {
         ...init?.headers
       }
     });
-  return { bridge, fake, call, baseUrl, controlToken };
+  const turn = (body: Record<string, unknown>, path = "/v1/chat/completions") =>
+    fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${capabilityToken(controlToken, "codex")}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+  const authStateOf = async (id: string) => {
+    const discovery = (await (await call("/capabilities")).json()) as {
+      adapters: Array<{ id: string; authState: string }>;
+    };
+    return discovery.adapters.find((adapter) => adapter.id === id)?.authState;
+  };
+  return { bridge, fake, call, turn, authStateOf, baseUrl, controlToken };
 }
 
 async function settled(
@@ -377,3 +458,79 @@ test("validates the reconnect timeout override", () => {
     "AGENT_BRIDGE_RECONNECT_TIMEOUT_MS must be a positive integer"
   );
 });
+
+test("expiry discovered by a failed turn reaches /capabilities and the error body", async () => {
+  const { fake, turn, authStateOf } = await harness({ codexRuntime: true });
+  await fake.signIn();
+
+  // 1. A signed-in adapter reads ready, and that reading is cached.
+  expect(await authStateOf("codex")).toBe("ready");
+
+  // 2. The credential expires under the bridge. Nothing observes this.
+  await fake.signOut();
+
+  // 3. The next turn fails. That failure is the only signal there is, so it
+  //    must invalidate the cache, re-probe, and classify.
+  const failed = await turn({
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }]
+  });
+  expect(failed.status).toBe(401);
+  expect(await failed.json()).toMatchObject({
+    error: { category: "auth_required", message: "stream error: unauthorized" }
+  });
+
+  // 4. A plain /capabilities — no refresh=1 — now reports it, so a host that
+  //    only polls discovery still learns to offer the reconnect action.
+  expect(await authStateOf("codex")).toBe("auth_required");
+}, 20_000);
+
+test("streaming lanes carry the same category after the status line is gone", async () => {
+  const { fake, turn } = await harness({ codexRuntime: true });
+  await fake.signOut();
+
+  const chat = await turn({
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+    stream: true
+  });
+  expect(chat.status).toBe(200);
+  const chatBody = await chat.text();
+  expect(chatBody).toContain('"category":"auth_required"');
+  expect(chatBody).toContain("data: [DONE]");
+
+  const responses = await turn(
+    { model: "gpt-test", input: "hello", stream: true },
+    "/v1/responses"
+  );
+  const responsesBody = await responses.text();
+  expect(responsesBody).toContain("response.failed");
+  expect(responsesBody).toContain('"category":"auth_required"');
+}, 20_000);
+
+test("re-probes an aged reading without waiting for a turn", async () => {
+  const { fake, authStateOf } = await harness({ probeTtlMs: () => 0 });
+  await fake.signIn();
+  expect(await authStateOf("codex")).toBe("ready");
+
+  await fake.signOut();
+  // No turn, no refresh=1: age alone must be enough for discovery to converge.
+  expect(await authStateOf("codex")).toBe("auth_required");
+});
+
+test("a request the bridge itself rejected is not evidence about credentials", async () => {
+  const { fake, turn, authStateOf } = await harness({ codexRuntime: true });
+  await fake.signIn();
+  expect(await authStateOf("codex")).toBe("ready");
+
+  await fake.signOut();
+  const rejected = await turn({ model: "gpt-test" });
+  expect(rejected.status).toBe(400);
+  expect(await rejected.json()).toMatchObject({
+    error: { category: "invalid_request" }
+  });
+
+  // A malformed body must not re-probe, must not spawn a CLI, and must not
+  // claim the credential died.
+  expect(await authStateOf("codex")).toBe("ready");
+}, 20_000);
