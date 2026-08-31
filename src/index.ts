@@ -61,7 +61,27 @@ import {
   materializeChatFileIds,
   materializeResponseFileIds
 } from "./files.js";
+import {
+  createReconnectManager,
+  type AdapterAuth
+} from "./reconnect.js";
 import { z } from "zod";
+
+export {
+  authSupport,
+  claudeCommand,
+  createReconnectManager,
+  parseClaudeAuthStatus,
+  reconnectTimeoutMs,
+  runLogin,
+  type AdapterAction,
+  type AdapterAuth,
+  type AuthState,
+  type AuthSupport,
+  type LoginSpec,
+  type ReconnectRun,
+  type ReconnectState
+} from "./reconnect.js";
 
 export type AdapterId = "claude" | "codex" | "grok" | "antigravity";
 export type AdapterCapability = {
@@ -79,9 +99,10 @@ export type AdapterCapability = {
     defaultReasoningEffort?: string;
   }>;
 };
-export type AgentBridgeAdapter = AdapterCapability & {
-  capabilityToken: string;
-};
+export type AgentBridgeAdapter = AdapterCapability &
+  AdapterAuth & {
+    capabilityToken: string;
+  };
 
 const imageCapabilitySchema = z.object({
   status: z.enum(["supported", "unsupported", "unknown"]),
@@ -156,6 +177,12 @@ const capabilitiesResponseSchema = z.object({
     version: z.string().nullable(),
     error: z.string().nullable(),
     capabilityToken: z.string().min(1),
+    // A server without the reconnect contract reports neither field. Treating
+    // that as "signed in, nothing offered" keeps an older bridge usable and
+    // keeps a host UI from rendering a button the server cannot serve.
+    authState: z.enum(["ready", "auth_required", "reauth_pending"])
+      .default("ready"),
+    actions: z.array(z.enum(["reconnect"])).default([]),
     inputs: z.object({
       image: inputCapabilitySchema,
       audio: inputCapabilitySchema,
@@ -380,6 +407,13 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function notFound() {
+  return Object.assign(new Error("Not found"), {
+    status: 404,
+    category: "not_found"
+  });
+}
+
 const runClaude = createClaudeRunner() as ChatRunner & { close(): void };
 
 function validateInputs(input: z.infer<typeof chatRequestSchema>, capability: AdapterCapability) {
@@ -442,7 +476,20 @@ export type AgentBridgeOptions = {
   controlToken?: string;
   preloadModels?: boolean;
   logger?: BridgeLogger | LoggerOptions;
+  /** Overrides the per-adapter login support map. Tests inject fakes here. */
+  reconnect?: Parameters<typeof createReconnectManager>[0];
 };
+
+const reconnectRequestSchema = z.object({
+  adapter: z.enum(["claude", "codex", "grok", "antigravity"])
+});
+
+const reconnectRunSchema = z.object({
+  reconnectId: z.string().min(1),
+  adapter: z.enum(["claude", "codex", "grok", "antigravity"]),
+  state: z.enum(["pending", "succeeded", "failed"]),
+  detail: z.string().optional()
+});
 
 export function createAgentBridge(options: AgentBridgeOptions = {}) {
   const logger: BridgeLogger =
@@ -469,6 +516,20 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       detectAntigravity()
     ])
   );
+  // Sign-in state is not cached with discovery: it changes under the bridge
+  // whenever a token expires or a reconnect finishes, while the model catalog
+  // does not. The manager owns its own short cache and invalidates it there.
+  const reconnect = createReconnectManager({
+    ...options.reconnect,
+    onEvent: (event) => {
+      logger.info(
+        "reconnect",
+        `${event.adapter} reconnect ${event.state}`,
+        { adapter: event.adapter, reconnectId: event.reconnectId }
+      );
+      options.reconnect?.onEvent?.(event);
+    }
+  });
   const markImageSupported = (
     capability: AdapterCapability | undefined,
     operation: "generation" | "edit" | "responsesImageGeneration"
@@ -528,18 +589,68 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       logInfo.adapter = "control";
       if (request.headers.authorization !== `Bearer ${controlToken}`) {
         return json(response, 401, {
-          error: { message: "Invalid control token" }
+          error: { message: "Invalid control token", category: "unauthorized" }
         });
       }
+      const refresh = url.searchParams.get("refresh") === "1";
+      if (refresh) reconnect.refresh();
+      const discovered = await capabilities(refresh);
       return json(response, 200, {
         files: fileStore.capability,
-        adapters: (await capabilities(
-          url.searchParams.get("refresh") === "1"
-        )).map((adapter) => ({
-          ...adapter,
-          capabilityToken: tokens[adapter.id]
-        }))
+        adapters: await Promise.all(
+          discovered.map(async (adapter) => ({
+            ...adapter,
+            ...(await reconnect.authState(adapter.id)),
+            capabilityToken: tokens[adapter.id]
+          }))
+        )
       });
+    }
+
+    if (url.pathname === "/reconnect" || url.pathname.startsWith("/reconnect/")) {
+      const reconnectPath =
+        url.pathname.match(/^\/reconnect(?:\/([^/]+?)(\/cancel)?)?$/) ?? [];
+      logInfo.adapter = "control";
+      if (request.headers.authorization !== `Bearer ${controlToken}`) {
+        return json(response, 401, {
+          error: { message: "Invalid control token", category: "unauthorized" }
+        });
+      }
+      try {
+        const id = reconnectPath[1];
+        if (!id && request.method === "POST") {
+          const parsed = reconnectRequestSchema.safeParse(await body(request));
+          if (!parsed.success) {
+            throw Object.assign(new Error(z.prettifyError(parsed.error)), {
+              status: 400,
+              category: "invalid_request"
+            });
+          }
+          const run = reconnect.start(parsed.data.adapter);
+          logInfo.reconnectAdapter = run.adapter;
+          return json(response, 202, run);
+        }
+        if (id && !reconnectPath[2] && request.method === "GET") {
+          const run = reconnect.status(decodeURIComponent(id));
+          if (!run) throw notFound();
+          return json(response, 200, run);
+        }
+        if (id && reconnectPath[2] && request.method === "POST") {
+          const run = await reconnect.cancel(decodeURIComponent(id));
+          if (!run) throw notFound();
+          return json(response, 200, run);
+        }
+        throw notFound();
+      } catch (error) {
+        logInfo.error = error instanceof Error ? error.message : String(error);
+        return json(response, Number(record(error).status ?? 500), {
+          error: {
+            message:
+              error instanceof Error ? error.message : "Reconnect failed",
+            category: String(record(error).category ?? "server_error")
+          }
+        });
+      }
     }
 
     const bearer = request.headers.authorization?.replace(/^Bearer\s+/i, "");
@@ -800,6 +911,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     server,
     capabilities,
     logger,
+    reconnectManager: reconnect,
     connection(adapter: AdapterId, baseUrl: string) {
       return {
         providerId: "local-agent-bridge",
@@ -810,6 +922,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     },
     async close() {
       runClaude.close();
+      await reconnect.close();
       await closeCodexSessions();
       await closeGrokSessions();
       await closeAntigravitySessions();
@@ -874,9 +987,49 @@ export function createAgentBridgeClient(clientOptions: {
   };
   const adapters = async (options: { refresh?: boolean } = {}) =>
     (await discovery(options)).adapters;
+  const control = async (path: string, init: RequestInit = {}) => {
+    const response = await fetcher(`${baseUrl}${path}`, {
+      ...init,
+      headers: {
+        ...init.headers,
+        authorization: `Bearer ${clientOptions.controlToken}`
+      },
+      signal: AbortSignal.timeout(20_000)
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      const error = record(record(payload).error);
+      throw Object.assign(
+        new Error(
+          typeof error.message === "string"
+            ? error.message
+            : `Agent Bridge returned ${response.status}`
+        ),
+        { status: response.status, category: error.category }
+      );
+    }
+    return reconnectRunSchema.parse(payload);
+  };
   return {
     discovery,
     adapters,
+    /**
+     * Starts the adapter's own CLI sign-in. Poll `reconnectStatus` until it
+     * leaves `pending`; the adapter reports `reauth_pending` in `/capabilities`
+     * meanwhile.
+     */
+    reconnect: (adapter: AdapterId) =>
+      control("/reconnect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ adapter })
+      }),
+    reconnectStatus: (reconnectId: string) =>
+      control(`/reconnect/${encodeURIComponent(reconnectId)}`),
+    cancelReconnect: (reconnectId: string) =>
+      control(`/reconnect/${encodeURIComponent(reconnectId)}/cancel`, {
+        method: "POST"
+      }),
     async connection(id: AdapterId) {
       const adapter = (await adapters()).find((item) => item.id === id);
       if (!adapter?.available) throw new Error(`${id} is unavailable.`);

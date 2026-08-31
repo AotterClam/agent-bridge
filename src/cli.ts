@@ -8,6 +8,7 @@ import {
   createAgentBridge,
   createLogger,
   listen,
+  type AdapterAuth,
   type AdapterCapability,
   type AdapterId,
   type LogLevel
@@ -69,12 +70,14 @@ ${c.bold("Environment Variables:")}
   AGENT_BRIDGE_LOG_FILE               Destination file path for logging
   AGENT_BRIDGE_LOG_FORMAT             Log output format: pretty | json
   AGENT_BRIDGE_ANTIGRAVITY_COMMAND    Path to Antigravity CLI executable (default: agy)
+  AGENT_BRIDGE_CLAUDE_COMMAND         Path to Claude CLI executable, reconnect only (default: claude)
   AGENT_BRIDGE_CODEX_COMMAND          Path to Codex CLI executable (default: codex)
   AGENT_BRIDGE_GROK_COMMAND           Path to Grok CLI executable (default: grok)
   AGENT_BRIDGE_ANTIGRAVITY_TIMEOUT_MS Antigravity turn timeout in ms (default: 300000)
   AGENT_BRIDGE_CLAUDE_TIMEOUT_MS      Claude turn timeout in ms (default: 300000)
   AGENT_BRIDGE_CODEX_TIMEOUT_MS       Codex turn timeout in ms (default: 300000)
   AGENT_BRIDGE_GROK_TIMEOUT_MS        Grok turn timeout in ms (default: 300000)
+  AGENT_BRIDGE_RECONNECT_TIMEOUT_MS   Reconnect login timeout in ms (default: 300000)
 
 ${c.bold("Examples:")}
   npx @aotterclam/agent-bridge
@@ -110,7 +113,7 @@ function renderBanner(baseUrl: string, controlToken: string) {
 }
 
 function renderAdapterStatus(
-  adapters: AdapterCapability[],
+  adapters: Array<AdapterCapability & AdapterAuth>,
   baseUrl: string,
   controlToken: string
 ) {
@@ -123,7 +126,28 @@ function renderAdapterStatus(
     const detail = a.available
       ? `(${a.models.length} model${a.models.length === 1 ? "" : "s"})`
       : c.dim(`(unavailable${a.error ? `: ${a.error}` : ""})`);
-    console.log(`  ${light}  ${id} ${name} ${c.dim(ver)} ${detail}`);
+    // A discovered catalog says nothing about sign-in, so an expired token
+    // otherwise reads as ONLINE right up until every turn fails.
+    const auth =
+      a.authState === "auth_required"
+        ? ` ${c.yellow("sign-in required")}`
+        : a.authState === "reauth_pending"
+          ? ` ${c.yellow("sign-in in progress")}`
+          : "";
+    console.log(`  ${light}  ${id} ${name} ${c.dim(ver)} ${detail}${auth}`);
+  }
+  const signedOut = adapters.find(
+    (a) => a.authState === "auth_required" && a.actions.includes("reconnect")
+  );
+  if (signedOut) {
+    console.log(
+      c.dim(
+        `  Re-authenticate without leaving your app: ` +
+          `curl -X POST -H "Authorization: Bearer ${controlToken}" ` +
+          `-H "Content-Type: application/json" ` +
+          `-d '{"adapter":"${signedOut.id}"}' ${baseUrl}/reconnect`
+      )
+    );
   }
 
   const online = adapters.filter((a) => a.available);
@@ -214,6 +238,16 @@ function renderAdapterStatus(
   }
 
   console.log(`${c.green("✔")} Ready for OpenAI requests. Press ${c.bold("Ctrl+C")} to stop.\n`);
+}
+
+async function withAuthState(bridge: ReturnType<typeof createAgentBridge>) {
+  const adapters = await bridge.capabilities();
+  return Promise.all(
+    adapters.map(async (adapter) => ({
+      ...adapter,
+      ...(await bridge.reconnectManager.authState(adapter.id))
+    }))
+  );
 }
 
 async function main() {
@@ -328,9 +362,14 @@ async function main() {
   if (!values.quiet) {
     if (logFormat === "json") {
       logger.info("server", "Agent bridge server started", { port: actualPort, baseUrl });
-      const adapters = await bridge.capabilities();
+      const adapters = await withAuthState(bridge);
       logger.info("discovery", "Agent runtimes discovered", {
-        adapters: adapters.map((a) => ({ id: a.id, name: a.name, available: a.available }))
+        adapters: adapters.map((a) => ({
+          id: a.id,
+          name: a.name,
+          available: a.available,
+          authState: a.authState
+        }))
       });
     } else {
       renderBanner(baseUrl, controlToken);
@@ -350,7 +389,7 @@ async function main() {
         console.log("\n◐ Discovering local coding agent runtimes...");
       }
 
-      const adapters = await bridge.capabilities();
+      const adapters = await withAuthState(bridge);
 
       if (timer) clearInterval(timer);
       if (isTTY) process.stdout.write("\r" + " ".repeat(60) + "\r");

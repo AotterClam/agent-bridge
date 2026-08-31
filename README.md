@@ -341,6 +341,9 @@ const result = streamText({
 ```text
 GET  /health
 GET  /capabilities
+POST /reconnect
+GET  /reconnect/{reconnect_id}
+POST /reconnect/{reconnect_id}/cancel
 GET  /v1/models
 GET  /v1/model/info
 GET  /model/info
@@ -355,7 +358,7 @@ GET  /v1/files/{file_id}/content
 DELETE /v1/files/{file_id}
 ```
 
-Chat completions support standard JSON and SSE streaming responses, OpenAI function-tool calls, and reasoning deltas. The `/v1` routes form the OpenAI-compatible data plane; `/capabilities` uses the separate control token for local discovery.
+Chat completions support standard JSON and SSE streaming responses, OpenAI function-tool calls, and reasoning deltas. The `/v1` routes form the OpenAI-compatible data plane; `/capabilities` and `/reconnect` use the separate control token for local discovery and sign-in.
 
 `/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. No response or item history is stored, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
@@ -475,6 +478,92 @@ The external runner covers `/v1/images/*`; the repository tests cover the `/v1/r
 
 ---
 
+## Sign-in state and reconnect
+
+A discovered model catalog says nothing about whether the runtime is still
+signed in, so an expired token reads as `available: true` right up until every
+turn fails. Each `/capabilities` adapter therefore also reports a
+provider-neutral sign-in contract, and hosts that embed the bridge can trigger
+a re-authentication without asking the user to open a terminal.
+
+| Field | Values | Meaning |
+| :--- | :--- | :--- |
+| `authState` | `ready` | The runtime answered that it is signed in |
+| | `auth_required` | The runtime answered that it is signed out |
+| | `reauth_pending` | A reconnect started through this bridge is in flight |
+| `actions` | `["reconnect"]` | `POST /reconnect` can drive this adapter's login |
+| | `[]` | No scriptable login; sign in with the vendor CLI yourself |
+
+```sh
+# Start the adapter's own sign-in (202)
+curl -X POST http://127.0.0.1:3457/reconnect \
+  -H "Authorization: Bearer <CONTROL_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"adapter":"codex"}'
+# => {"reconnectId":"reconnect-…","adapter":"codex","state":"pending"}
+
+# Poll until it leaves "pending"
+curl -H "Authorization: Bearer <CONTROL_TOKEN>" \
+  http://127.0.0.1:3457/reconnect/<RECONNECT_ID>
+# => {"reconnectId":"…","adapter":"codex","state":"succeeded","detail":"…"}
+
+# Give up early (idempotent)
+curl -X POST -H "Authorization: Bearer <CONTROL_TOKEN>" \
+  http://127.0.0.1:3457/reconnect/<RECONNECT_ID>/cancel
+```
+
+A second start for an adapter that is already reconnecting returns `409`. An
+adapter with no scriptable login returns `400` with category `unsupported`.
+Unlike the OpenAI-compatible `/v1` lane, control-plane errors carry
+`{"error":{"message":…,"category":…}}`, where category is one of
+`unsupported`, `conflict`, `invalid_request`, `not_found`, `unauthorized`, or
+`server_error`.
+
+The client SDK exposes the same three calls:
+
+```ts
+const bridge = await startAgentBridge();
+const [codex] = (await bridge.adapters()).filter((a) => a.id === "codex");
+
+if (codex.authState === "auth_required" && codex.actions.includes("reconnect")) {
+  const { reconnectId } = await bridge.reconnect("codex");
+  // poll bridge.reconnectStatus(reconnectId) until state !== "pending",
+  // or bridge.cancelReconnect(reconnectId) to abandon it
+}
+```
+
+### What each adapter can and cannot detect
+
+| Adapter | Detection probe | Login | Boundary |
+| :--- | :--- | :--- | :--- |
+| Codex | `codex login status` exit code | `codex login` | A missing executable and a signed-out host both read as `auth_required` |
+| Claude Code | `claude auth status --json` → `loggedIn` | `claude auth login` | An unreadable probe reports `ready`, not `auth_required` |
+| Grok Build | none | none | `actions: []`; sign in with `grok` yourself |
+| Antigravity | none | none | `actions: []`; sign in with `agy` yourself |
+
+Honest limits of this lane:
+
+- The login child runs with **all three stdio streams ignored**. An
+  authorization URL carries state and PKCE parameters, so nothing the child
+  writes is captured, logged, or returned, and `detail` is bridge-authored
+  text only. The consequence is that the CLI must open a browser and finish on
+  its own loopback callback; where it instead falls back to asking the user to
+  paste a code into the terminal, this endpoint cannot complete the flow and
+  fails on exit or timeout.
+- Neither CLI reports machine-readable progress while a login runs, so a
+  reconnect is `pending` until the process exits. Exit `0` is treated as
+  necessary but not sufficient: the bridge re-runs the detection probe and only
+  reports `succeeded` when the runtime confirms it is signed in.
+- The Claude lane runs the Agent SDK, which resolves its own executable.
+  Credentials are keyed to the config directory (`CLAUDE_CONFIG_DIR`), not to a
+  particular binary, so signing in through `AGENT_BRIDGE_CLAUDE_COMMAND` on the
+  same config directory is what the SDK reads back. Point that variable at the
+  matching install if you keep several.
+- The bridge does not list accounts, read quota, or store tokens. Those stay
+  with the CLIs that already own them.
+
+---
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -484,9 +573,11 @@ The external runner covers `/v1/images/*`; the repository tests cover the `/v1/r
 | `AGENT_BRIDGE_LOG_LEVEL` | `info` | Default log level (`debug`, `info`, `warn`, `error`, `silent`) |
 | `AGENT_BRIDGE_LOG_FILE` | - | Default file path for structured log output |
 | `AGENT_BRIDGE_LOG_FORMAT` | `pretty` | Log output style (`pretty` or `json`) |
+| `AGENT_BRIDGE_RECONNECT_TIMEOUT_MS` | `300000` | Reconnect login timeout |
 | `AGENT_BRIDGE_ANTIGRAVITY_TIMEOUT_MS` | `300000` | Antigravity turn timeout |
 | `AGENT_BRIDGE_ANTIGRAVITY_COMMAND` | `agy` | Antigravity CLI executable |
 | `AGENT_BRIDGE_CLAUDE_TIMEOUT_MS` | `300000` | Claude turn timeout |
+| `AGENT_BRIDGE_CLAUDE_COMMAND` | `claude` | Claude CLI executable, used by reconnect only |
 | `AGENT_BRIDGE_CODEX_TIMEOUT_MS` | `300000` | Codex turn timeout |
 | `AGENT_BRIDGE_CODEX_COMMAND` | `codex` | Codex executable |
 | `AGENT_BRIDGE_GROK_TIMEOUT_MS` | `300000` | Grok turn timeout |
