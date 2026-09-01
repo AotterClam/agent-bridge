@@ -4,15 +4,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  authSupport,
   capabilityToken,
   createAgentBridge,
-  listen,
+  listen
+} from "../src/index.js";
+import {
+  authSupport,
+  createReconnectManager,
   parseClaudeAuthStatus,
   reconnectTimeoutMs,
   runLogin,
   type AuthSupport
-} from "../src/index.js";
+} from "../src/reconnect.js";
 import { closeCodexSessions } from "../src/codex.js";
 
 /**
@@ -345,6 +348,12 @@ test("rejects unknown ids, unknown adapters, and the wrong control token", async
     body: JSON.stringify({ adapter: "codex" })
   });
   expect(unauthorized.status).toBe(401);
+
+  const malformed = await call("/reconnect/%");
+  expect(malformed.status).toBe(400);
+  expect(await malformed.json()).toMatchObject({
+    error: { category: "invalid_request" }
+  });
 });
 
 test("times out a stalled login and reaps the child", async () => {
@@ -516,6 +525,35 @@ test("re-probes an aged reading without waiting for a turn", async () => {
   await fake.signOut();
   // No turn, no refresh=1: age alone must be enough for discovery to converge.
   expect(await authStateOf("codex")).toBe("auth_required");
+});
+
+test("does not cache a probe invalidated while it was running", async () => {
+  let release!: (result: { state: "auth_required" }) => void;
+  let calls = 0;
+  const manager = createReconnectManager({
+    support: {
+      codex: {
+        label: "fake login",
+        login: () => ({ command: process.execPath, args: ["--version"] }),
+        probe: () => {
+          calls++;
+          return calls === 1
+            ? new Promise((resolve) => { release = resolve; })
+            : Promise.resolve({ state: "ready" });
+        }
+      }
+    }
+  });
+
+  const stale = manager.authState("codex");
+  manager.refresh();
+  const fresh = manager.authState("codex");
+  release({ state: "auth_required" });
+
+  expect(await stale).toMatchObject({ authState: "ready" });
+  expect(await fresh).toMatchObject({ authState: "ready" });
+  expect(calls).toBe(2);
+  await manager.close();
 });
 
 test("a request the bridge itself rejected is not evidence about credentials", async () => {

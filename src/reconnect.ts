@@ -223,22 +223,6 @@ export type ReconnectRun = {
   detail?: string;
 };
 
-export class ReconnectUnsupported extends Error {
-  readonly status = 400;
-  readonly category = "unsupported";
-  constructor(adapter: string) {
-    super(`${adapter} does not support reconnect through this bridge.`);
-  }
-}
-
-export class ReconnectConflict extends Error {
-  readonly status = 409;
-  readonly category = "conflict";
-  constructor(adapter: string, readonly reconnectId: string) {
-    super(`${adapter} already has a reconnect in progress.`);
-  }
-}
-
 type ActiveRun = ReconnectRun & { cancel: (reason?: string) => Promise<void> };
 
 /**
@@ -278,21 +262,35 @@ export function createReconnectManager(
    * - Age — a reading older than `probeTtlMs` is re-probed, so a host that
    *   polls `/capabilities` without running turns still converges.
    *
-   * Reconnect *start* needs no entry here: `active` short-circuits the cache
-   * to `reauth_pending` for as long as a login runs. Process restart needs no
-   * entry either — a new process gets an empty map.
+   * Reconnect start bumps the revision so a pre-login probe cannot finish
+   * after the login and restore stale state; `active` reports
+   * `reauth_pending` while the login runs. A process restart gets empty maps.
    */
   const probed = new Map<AdapterId, { result: AuthProbeResult; at: number }>();
-  // Concurrent failures and concurrent discovery must not each spawn a CLI.
-  const inFlight = new Map<AdapterId, Promise<AuthProbeResult>>();
+  const revisions = new Map<AdapterId, number>();
+  const inFlight = new Map<
+    AdapterId,
+    { revision: number; promise: Promise<AuthProbeResult> }
+  >();
 
-  const probe = (adapter: AdapterId, capability: AuthSupport) => {
+  const invalidate = (adapter: AdapterId) => {
+    probed.delete(adapter);
+    revisions.set(adapter, (revisions.get(adapter) ?? 0) + 1);
+  };
+
+  const probe = (
+    adapter: AdapterId,
+    capability: AuthSupport,
+    revision: number
+  ) => {
     const running = inFlight.get(adapter);
-    if (running) return running;
+    if (running?.revision === revision) return running.promise;
     const started = capability
       .probe()
-      .finally(() => inFlight.delete(adapter));
-    inFlight.set(adapter, started);
+      .finally(() => {
+        if (inFlight.get(adapter)?.promise === started) inFlight.delete(adapter);
+      });
+    inFlight.set(adapter, { revision, promise: started });
     return started;
   };
 
@@ -310,7 +308,7 @@ export function createReconnectManager(
     if (active.get(run.adapter) === run.reconnectId) active.delete(run.adapter);
     // A login can change the stored credential either way, so the cached
     // reading is dropped and the next `authState` re-probes the runtime.
-    probed.delete(run.adapter);
+    invalidate(run.adapter);
     options.onEvent?.({
       adapter: run.adapter,
       reconnectId: run.reconnectId,
@@ -328,11 +326,13 @@ export function createReconnectManager(
       const entry = probed.get(adapter);
       const fresh =
         entry && Date.now() - entry.at < probeTtl() ? entry.result : undefined;
-      const result = fresh ?? (await probe(adapter, capability));
-      if (!fresh) probed.set(adapter, { result, at: Date.now() });
-      // A login that started while the probe was running wins: the probe read
-      // the pre-login credential and is already stale.
+      const revision = revisions.get(adapter) ?? 0;
+      const result = fresh ?? (await probe(adapter, capability, revision));
       if (active.has(adapter)) return { authState: "reauth_pending", actions };
+      if ((revisions.get(adapter) ?? 0) !== revision) {
+        return this.authState(adapter);
+      }
+      if (!fresh) probed.set(adapter, { result, at: Date.now() });
       return { authState: result.state, actions };
     },
 
@@ -344,21 +344,34 @@ export function createReconnectManager(
      * confirm a sign-in problem it has no way to observe.
      */
     async recheck(adapter: AdapterId): Promise<AdapterAuth> {
-      probed.delete(adapter);
+      invalidate(adapter);
       return this.authState(adapter);
     },
 
     /** Drops cached probe readings so the next `authState` re-runs them. */
     refresh() {
-      probed.clear();
+      for (const adapter of Object.keys(support) as AdapterId[]) {
+        invalidate(adapter);
+      }
     },
 
     start(adapter: AdapterId): ReconnectRun {
       const capability = support[adapter];
-      if (!capability) throw new ReconnectUnsupported(adapter);
+      if (!capability) {
+        throw Object.assign(
+          new Error(`${adapter} does not support reconnect through this bridge.`),
+          { status: 400, category: "unsupported" }
+        );
+      }
       const existing = active.get(adapter);
-      if (existing) throw new ReconnectConflict(adapter, existing);
+      if (existing) {
+        throw Object.assign(
+          new Error(`${adapter} already has a reconnect in progress.`),
+          { status: 409, category: "conflict" }
+        );
+      }
 
+      invalidate(adapter);
       const login = runLogin(capability, timeout());
       const run: ActiveRun = {
         reconnectId: `reconnect-${crypto.randomUUID()}`,
@@ -400,6 +413,7 @@ export function createReconnectManager(
       runs.clear();
       active.clear();
       probed.clear();
+      revisions.clear();
       inFlight.clear();
     }
   };

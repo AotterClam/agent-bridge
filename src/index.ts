@@ -68,12 +68,6 @@ import {
 import { z } from "zod";
 
 export {
-  authSupport,
-  claudeCommand,
-  createReconnectManager,
-  parseClaudeAuthStatus,
-  reconnectTimeoutMs,
-  runLogin,
   type AdapterAction,
   type AdapterAuth,
   type AuthState,
@@ -414,6 +408,17 @@ function notFound() {
   });
 }
 
+function decodePathSegment(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw Object.assign(new Error("Invalid URL encoding"), {
+      status: 400,
+      category: "invalid_request"
+    });
+  }
+}
+
 /**
  * The bridge's provider-neutral error classification, carried as
  * `error.category` on every control-plane and data-plane failure and on both
@@ -563,13 +568,20 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
    * `auth_required`, which is the same standard field the control plane uses —
    * a host reads one field instead of pattern-matching a runtime's error prose.
    */
-  const classifyTurnFailure = async (adapterId: AdapterId, error: unknown) => {
+  const classifyTurnFailure = async (
+    adapterId: AdapterId,
+    error: unknown,
+    runtimeFailure = false
+  ) => {
     const failure = error instanceof Error ? error : new Error("Bridge failed");
     // Already classified (both the streaming wrapper and the request catch run
     // this), or rejected by the bridge before the runtime ever saw it — a
     // malformed body is not evidence about credentials and must not spawn a CLI.
     const status = Number(record(error).status ?? 0);
-    if (record(error).category || (status >= 400 && status < 500)) return failure;
+    if (
+      record(error).category ||
+      (!runtimeFailure && status >= 400 && status < 500)
+    ) return failure;
     const { authState } = await reconnect.recheck(adapterId);
     if (authState !== "auth_required") return failure;
     return Object.assign(failure, { status: 401, category: "auth_required" });
@@ -581,7 +593,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       } catch (error) {
         // Streaming lanes settle their own errors inside the SSE body and
         // never reach the request catch, so classification happens here too.
-        throw await classifyTurnFailure(adapterId, error);
+        throw await classifyTurnFailure(adapterId, error, true);
       }
     };
   const markImageSupported = (
@@ -685,12 +697,12 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           return json(response, 202, run);
         }
         if (id && !reconnectPath[2] && request.method === "GET") {
-          const run = reconnect.status(decodeURIComponent(id));
+          const run = reconnect.status(decodePathSegment(id));
           if (!run) throw notFound();
           return json(response, 200, run);
         }
         if (id && reconnectPath[2] && request.method === "POST") {
-          const run = await reconnect.cancel(decodeURIComponent(id));
+          const run = await reconnect.cancel(decodePathSegment(id));
           if (!run) throw notFound();
           return json(response, 200, run);
         }
@@ -732,7 +744,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           });
         }
         if (filePath) {
-          const id = decodeURIComponent(filePath[1]!);
+          const id = decodePathSegment(filePath[1]!);
           if (request.method === "GET" && filePath[2]) {
             const file = await fileStore.read(adapter, id);
             response.writeHead(200, {
@@ -748,7 +760,9 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
             return json(response, 200, await fileStore.delete(adapter, id));
           }
         }
-        return json(response, 404, { error: { message: "Not found" } });
+        return json(response, 404, {
+          error: { message: "Not found", category: "not_found" }
+        });
       } catch (error) {
         logInfo.error = error instanceof Error ? error.message : String(error);
         const status = Number(record(error).status ?? 500);
@@ -803,7 +817,9 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       !isImages &&
       (request.method !== "POST" || url.pathname !== "/v1/chat/completions")
     ) {
-      return json(response, 404, { error: { message: "Not found" } });
+      return json(response, 404, {
+        error: { message: "Not found", category: "not_found" }
+      });
     }
     const mediaType = request.headers["content-type"]?.split(";", 1)[0];
     if (
@@ -814,7 +830,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         error: {
           message: isImageEdit
             ? "Content-Type must be application/json or multipart/form-data"
-            : "Content-Type must be application/json"
+            : "Content-Type must be application/json",
+          category: "invalid_request"
         }
       });
     }
