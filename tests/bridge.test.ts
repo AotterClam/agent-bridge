@@ -230,11 +230,6 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 }, 10_000);
 
 test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
-  // The reported case, in the exact shape zod-to-json-schema actually emits for a plain
-  // (non-rest) zod tuple: a same-typed `items` array plus minItems === maxItems ===
-  // items.length. Every position already required the same schema, and the array was
-  // already closed to exactly 4 items, so collapsing to one `items` schema changes
-  // nothing observable — it is not an approximation for this shape.
   expect(toCodexCompatibleSchema({
     type: "object",
     properties: {
@@ -257,9 +252,6 @@ test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
     }
   });
 
-  // The other schema-author idiom for a closed tuple: additionalItems: false instead of
-  // an explicit maxItems. additionalItems is dropped from the output — once items/min/max
-  // pin the array to exactly 2, "no additional items" is already implied and vacuous.
   expect(toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "boolean" }, { type: "boolean" }],
@@ -272,7 +264,6 @@ test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
     maxItems: 2
   });
 
-  // A single-element pinned tuple collapses the same way.
   expect(toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "string" }],
@@ -285,7 +276,6 @@ test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
     maxItems: 1
   });
 
-  // Nesting: a pinned tuple inside `properties`/`anyOf` still collapses recursively.
   expect(toCodexCompatibleSchema({
     type: "object",
     properties: {
@@ -312,24 +302,23 @@ test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
     required: ["tags"]
   });
 
-  // Non-tuple (already-single) `items` schemas, scalars, null, and bare arrays pass
-  // through unchanged — there is nothing tuple-shaped to reject or rewrite.
   expect(toCodexCompatibleSchema("string")).toBe("string");
   expect(toCodexCompatibleSchema(null)).toBeNull();
   expect(toCodexCompatibleSchema(undefined)).toBeUndefined();
   expect(toCodexCompatibleSchema([1, 2, 3])).toEqual([1, 2, 3]);
   expect(toCodexCompatibleSchema({ type: "object", properties: {} }))
     .toEqual({ type: "object", properties: {} });
+
+  const metadata = { items: [{ type: "string" }, { type: "number" }] };
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    default: metadata,
+    examples: [metadata],
+    const: metadata
+  })).toEqual({ type: "object", default: metadata, examples: [metadata], const: metadata });
 });
 
 test("fails fast instead of guessing at a tuple rewrite that isn't provably safe", () => {
-  // Heterogeneous tuple, even though its length is pinned: a positional contract
-  // (position 0 is a string, position 1 is a number) cannot be collapsed to one shared
-  // schema without changing meaning. The old `anyOf`-based rewrite would have produced
-  // `items: { anyOf: [{type:"string"},{type:"number"}] }`, which — unlike the original
-  // tuple — accepts the reversed order `[<number>, <string>]` because `anyOf` applies
-  // independently to every position. That silent acceptance is exactly what must not
-  // happen, so this now throws instead of emitting that schema.
   expect(() => toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "string" }, { type: "number" }],
@@ -337,18 +326,11 @@ test("fails fast instead of guessing at a tuple rewrite that isn't provably safe
     maxItems: 2
   })).toThrow('tuple-form "items"');
 
-  // Homogeneous but open-length: without minItems/maxItems/additionalItems, positions
-  // beyond the tuple are legal and unconstrained in the original schema. Pinning
-  // minItems/maxItems here (the old behavior) would reject previously-valid extra
-  // elements, so this is rejected rather than guessed at.
   expect(() => toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "number" }, { type: "number" }]
   })).toThrow('tuple-form "items"');
 
-  // Homogeneous but only upper-bounded (minItems does not match the tuple length): the
-  // array may legitimately be shorter than the tuple, which is a different contract than
-  // "exactly length items."
   expect(() => toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "number" }, { type: "number" }],
@@ -356,9 +338,6 @@ test("fails fast instead of guessing at a tuple rewrite that isn't provably safe
     maxItems: 2
   })).toThrow('tuple-form "items"');
 
-  // additionalItems as a schema (zod's `.tuple([...]).rest(...)`, which zod-to-json-schema
-  // renders as `items` + `minItems` + `additionalItems: <schema>`, no maxItems) is not one
-  // of the two provably-safe shapes either.
   expect(() => toCodexCompatibleSchema({
     type: "array",
     items: [{ type: "number" }, { type: "number" }],
@@ -366,8 +345,14 @@ test("fails fast instead of guessing at a tuple rewrite that isn't provably safe
     additionalItems: { type: "string" }
   })).toThrow('tuple-form "items"');
 
-  // The error surfaces through recursion: a nested unsafe tuple fails the whole schema,
-  // not just the inner fragment.
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 2,
+    maxItems: 1,
+    additionalItems: false
+  })).toThrow('tuple-form "items"');
+
   expect(() => toCodexCompatibleSchema({
     type: "object",
     properties: {

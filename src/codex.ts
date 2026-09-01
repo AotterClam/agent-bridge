@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import {
   HOST_TOOL_INSTRUCTIONS,
   promptFor,
@@ -50,93 +50,72 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/**
- * Structural equality for JSON Schema fragments (plain JSON values: objects, arrays,
- * strings, numbers, booleans, null). Used to check whether every position of a tuple
- * demands the identical schema — see toCodexCompatibleSchema below.
- */
-function schemasEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    return (
-      Array.isArray(a) &&
-      Array.isArray(b) &&
-      a.length === b.length &&
-      a.every((value, index) => schemasEqual(value, b[index]))
-    );
-  }
-  if (a && b && typeof a === "object" && typeof b === "object") {
-    const aKeys = Object.keys(a as Record<string, unknown>);
-    const bKeys = Object.keys(b as Record<string, unknown>);
-    return (
-      aKeys.length === bKeys.length &&
-      aKeys.every((key) =>
-        Object.prototype.hasOwnProperty.call(b, key) &&
-        schemasEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])
-      )
-    );
-  }
-  return false;
-}
-
-/**
- * True when a tuple-form `items` array of the given length is provably closed to
- * exactly that length by the schema itself — either an explicit `minItems`/`maxItems`
- * pair equal to the length, or `additionalItems: false` combined with `minItems` equal
- * to the length. Anything looser (an open-ended or merely upper-bounded tuple) cannot
- * be safely collapsed — see toCodexCompatibleSchema.
- */
 function isPinnedTupleLength(obj: Record<string, unknown>, length: number): boolean {
   if (obj.minItems === length && obj.maxItems === length) return true;
-  return obj.additionalItems === false && obj.minItems === length;
+  return (
+    obj.additionalItems === false &&
+    obj.minItems === length &&
+    obj.maxItems === undefined
+  );
 }
 
+const SCHEMA_MAP_KEYS = [
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "patternProperties",
+  "properties"
+] as const;
+const SCHEMA_ARRAY_KEYS = ["allOf", "anyOf", "oneOf", "prefixItems"] as const;
+const SCHEMA_KEYS = [
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "contentSchema",
+  "else",
+  "if",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties"
+] as const;
+
 /**
- * codex app-server's dynamicTools inputSchema parser (Rust/serde) does not accept the
- * JSON Schema "tuple" form of `items` — an array of one schema per position, as zod's
- * `z.tuple([...])` produces. Sent verbatim, thread/start rejects the whole request with
- * `dynamic tool input schema is not supported for <tool>: invalid type: map, expected a
- * string` (root-caused against a live app-server by bisecting the schema; not a guess).
- * No other adapter needs this: Claude's path (claude-bridge.mjs `toolShape`) converts
- * the same JSON Schema through zod's `fromJSONSchema`, which has explicit draft-7 tuple
- * support, before handing tools to claude-agent-sdk's in-process MCP server; and the
- * OpenAI-compatible /chat/completions and /responses surfaces never validate `parameters`
- * beyond "is it an object" (see protocol.ts's chatRequestSchema). So this rewrite is
- * scoped to the Codex wire format only, not the shared ChatRequest tool schema.
- *
- * A JSON Schema tuple is a positional contract — position 0 must match items[0],
- * position 1 must match items[1], and so on — and, unless the schema closes the array
- * (via minItems/maxItems or additionalItems: false), positions beyond the tuple are
- * still legal and unconstrained. Collapsing that into one schema for every position
- * (e.g. `anyOf` across the per-position schemas) is NOT equivalent in general: it would
- * accept a permutation the original tuple rejected (position 0 matching items[1]'s
- * schema instead of items[0]'s), and pinning minItems/maxItems on a schema that never
- * had them would reject previously-legal extra elements. Only one shape is provably
- * safe to rewrite: every position already requires the identical schema (so there is no
- * positional distinction to lose) AND the schema already pins the array to exactly that
- * many items (so no length constraint is invented). In that case the tuple degenerates
- * to "exactly N items, each matching schema A" — expressible as a single `items` schema
- * plus `minItems`/`maxItems`, which is what codex app-server accepts.
- *
- * Everything else (a heterogeneous tuple, or a homogeneous one whose length is open or
- * only upper-bounded) is rejected with a descriptive error instead of guessed at — a
- * general-purpose bridge must not silently narrow or loosen a caller's tool contract.
- * Same safe-subset fix already shipped and field-verified against a live codex
- * app-server in loomlore's own Codex runtime (`toCodexCompatibleSchema`, covering the
- * homogeneous-fixed-length case this also targets) before landing here.
+ * Codex rejects draft-7 tuple-form `items`. Collapse only homogeneous tuples
+ * whose length is already exact; every other rewrite would change the caller's
+ * positional or length contract, so it fails before the first RPC instead.
  */
 export function toCodexCompatibleSchema(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(toCodexCompatibleSchema);
-  if (!schema || typeof schema !== "object") return schema;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
   const obj = schema as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (key === "items") continue; // handled below: may be a tuple (array) or a single schema.
-    out[key] = toCodexCompatibleSchema(value);
+  const out = { ...obj };
+  for (const key of SCHEMA_MAP_KEYS) {
+    const map = obj[key];
+    if (map && typeof map === "object" && !Array.isArray(map)) {
+      out[key] = Object.fromEntries(
+        Object.entries(map).map(([name, nested]) => [name, toCodexCompatibleSchema(nested)])
+      );
+    }
+  }
+  const dependencies = obj.dependencies;
+  if (dependencies && typeof dependencies === "object" && !Array.isArray(dependencies)) {
+    out.dependencies = Object.fromEntries(
+      Object.entries(dependencies).map(([name, nested]) => [
+        name,
+        Array.isArray(nested) ? nested : toCodexCompatibleSchema(nested)
+      ])
+    );
+  }
+  for (const key of SCHEMA_ARRAY_KEYS) {
+    if (Array.isArray(obj[key])) out[key] = obj[key].map(toCodexCompatibleSchema);
+  }
+  for (const key of SCHEMA_KEYS) {
+    if (obj[key] !== undefined) out[key] = toCodexCompatibleSchema(obj[key]);
   }
   const items = obj.items;
   if (Array.isArray(items)) {
-    const homogeneous = items.length > 0 && items.every((item) => schemasEqual(item, items[0]));
+    const homogeneous = items.length > 0 && items.every((item) => isDeepStrictEqual(item, items[0]));
     if (!homogeneous || !isPinnedTupleLength(obj, items.length)) {
       throw new Error(
         `tuple-form "items" (${items.length} per-position schemas) is not supported ` +
@@ -156,12 +135,6 @@ export function toCodexCompatibleSchema(schema: unknown): unknown {
   return out;
 }
 
-/**
- * Builds the dynamicTools payload for thread/start, converting each tool's parameters
- * through toCodexCompatibleSchema. Runs — and can throw — before the RPC request is
- * ever sent, so an unsupported schema fails the turn locally with a message naming the
- * offending tool instead of being forwarded to codex app-server for a generic rejection.
- */
 function codexDynamicTools(input: ChatRequest) {
   return selectedTools(input).map(({ function: tool }) => {
     let inputSchema: unknown;
