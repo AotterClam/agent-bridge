@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import {
   HOST_TOOL_INSTRUCTIONS,
   promptFor,
@@ -48,6 +48,109 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function isPinnedTupleLength(obj: Record<string, unknown>, length: number): boolean {
+  if (obj.minItems === length && obj.maxItems === length) return true;
+  return (
+    obj.additionalItems === false &&
+    obj.minItems === length &&
+    obj.maxItems === undefined
+  );
+}
+
+const SCHEMA_MAP_KEYS = [
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "patternProperties",
+  "properties"
+] as const;
+const SCHEMA_ARRAY_KEYS = ["allOf", "anyOf", "oneOf", "prefixItems"] as const;
+const SCHEMA_KEYS = [
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "contentSchema",
+  "else",
+  "if",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties"
+] as const;
+
+/**
+ * Codex rejects draft-7 tuple-form `items`. Collapse only homogeneous tuples
+ * whose length is already exact; every other rewrite would change the caller's
+ * positional or length contract, so it fails before the first RPC instead.
+ */
+export function toCodexCompatibleSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
+  const obj = schema as Record<string, unknown>;
+  const out = { ...obj };
+  for (const key of SCHEMA_MAP_KEYS) {
+    const map = obj[key];
+    if (map && typeof map === "object" && !Array.isArray(map)) {
+      out[key] = Object.fromEntries(
+        Object.entries(map).map(([name, nested]) => [name, toCodexCompatibleSchema(nested)])
+      );
+    }
+  }
+  const dependencies = obj.dependencies;
+  if (dependencies && typeof dependencies === "object" && !Array.isArray(dependencies)) {
+    out.dependencies = Object.fromEntries(
+      Object.entries(dependencies).map(([name, nested]) => [
+        name,
+        Array.isArray(nested) ? nested : toCodexCompatibleSchema(nested)
+      ])
+    );
+  }
+  for (const key of SCHEMA_ARRAY_KEYS) {
+    if (Array.isArray(obj[key])) out[key] = obj[key].map(toCodexCompatibleSchema);
+  }
+  for (const key of SCHEMA_KEYS) {
+    if (obj[key] !== undefined) out[key] = toCodexCompatibleSchema(obj[key]);
+  }
+  const items = obj.items;
+  if (Array.isArray(items)) {
+    const homogeneous = items.length > 0 && items.every((item) => isDeepStrictEqual(item, items[0]));
+    if (!homogeneous || !isPinnedTupleLength(obj, items.length)) {
+      throw new Error(
+        `tuple-form "items" (${items.length} per-position schemas) is not supported ` +
+        `unless every position uses the identical schema and the array length is pinned ` +
+        `to exactly ${items.length} (minItems === maxItems === ${items.length}, or ` +
+        `additionalItems: false with minItems === ${items.length}). Restructure this ` +
+        `parameter as an object, or as a single "items" schema instead of a positional tuple.`
+      );
+    }
+    out.items = toCodexCompatibleSchema(items[0]);
+    out.minItems = items.length;
+    out.maxItems = items.length;
+    delete out.additionalItems; // vacuous once the array is pinned to exactly items.length.
+  } else if (items !== undefined) {
+    out.items = toCodexCompatibleSchema(items);
+  }
+  return out;
+}
+
+function codexDynamicTools(input: ChatRequest) {
+  return selectedTools(input).map(({ function: tool }) => {
+    let inputSchema: unknown;
+    try {
+      inputSchema = toCodexCompatibleSchema(tool.parameters ?? { type: "object", properties: {} });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Codex tool "${tool.name}" has an unsupported parameter schema: ${reason}`);
+    }
+    return {
+      type: "function" as const,
+      name: tool.name,
+      description: tool.description ?? "",
+      inputSchema
+    };
+  });
 }
 
 function command() {
@@ -573,6 +676,10 @@ class CodexSession {
   }
 
   private async initialize(input: ChatRequest) {
+    // Resolved before any RPC round-trip: an unsupported tool schema should fail the
+    // turn immediately, not after a handshake with a codex process that is about to be
+    // torn down anyway.
+    const dynamicTools = codexDynamicTools(input);
     await this.client.request("initialize", {
       clientInfo: { name: "agent-bridge", title: "Agent Bridge", version: "0.1.0" },
       capabilities: { experimentalApi: true, requestAttestation: false }
@@ -584,12 +691,7 @@ class CodexSession {
       approvalPolicy: "never",
       sandbox: "read-only",
       ephemeral: true,
-      dynamicTools: selectedTools(input).map(({ function: tool }) => ({
-        type: "function",
-        name: tool.name,
-        description: tool.description ?? "",
-        inputSchema: tool.parameters ?? { type: "object", properties: {} }
-      })),
+      dynamicTools,
       baseInstructions: HOST_TOOL_INSTRUCTIONS
     }));
     const threadId = record(started.thread).id;

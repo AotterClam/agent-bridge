@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,7 +8,8 @@ import {
   codexTurnTimeoutMs,
   completedCodexTurn,
   recoverTextToolCall,
-  runCodex
+  runCodex,
+  toCodexCompatibleSchema
 } from "../src/codex.js";
 import {
   chatRequestSchema,
@@ -220,6 +221,284 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         ]
       }]
     }))).toMatchObject({ content: "vision", finishReason: "stop" });
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("collapses a homogeneous, length-pinned tuple to a single schema", () => {
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      coords: {
+        type: "array",
+        items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }],
+        minItems: 4,
+        maxItems: 4
+      }
+    }
+  })).toEqual({
+    type: "object",
+    properties: {
+      coords: {
+        type: "array",
+        items: { type: "number" },
+        minItems: 4,
+        maxItems: 4
+      }
+    }
+  });
+
+  expect(toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "boolean" }, { type: "boolean" }],
+    minItems: 2,
+    additionalItems: false
+  })).toEqual({
+    type: "array",
+    items: { type: "boolean" },
+    minItems: 2,
+    maxItems: 2
+  });
+
+  expect(toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "string" }],
+    minItems: 1,
+    maxItems: 1
+  })).toEqual({
+    type: "array",
+    items: { type: "string" },
+    minItems: 1,
+    maxItems: 1
+  });
+
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      tags: { type: "array", items: { type: "string" } },
+      score: {
+        anyOf: [
+          { type: "array", items: [{ type: "number" }, { type: "number" }], minItems: 2, maxItems: 2 },
+          { type: "null" }
+        ]
+      }
+    },
+    required: ["tags"]
+  })).toEqual({
+    type: "object",
+    properties: {
+      tags: { type: "array", items: { type: "string" } },
+      score: {
+        anyOf: [
+          { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
+          { type: "null" }
+        ]
+      }
+    },
+    required: ["tags"]
+  });
+
+  expect(toCodexCompatibleSchema("string")).toBe("string");
+  expect(toCodexCompatibleSchema(null)).toBeNull();
+  expect(toCodexCompatibleSchema(undefined)).toBeUndefined();
+  expect(toCodexCompatibleSchema([1, 2, 3])).toEqual([1, 2, 3]);
+  expect(toCodexCompatibleSchema({ type: "object", properties: {} }))
+    .toEqual({ type: "object", properties: {} });
+
+  const metadata = { items: [{ type: "string" }, { type: "number" }] };
+  expect(toCodexCompatibleSchema({
+    type: "object",
+    default: metadata,
+    examples: [metadata],
+    const: metadata
+  })).toEqual({ type: "object", default: metadata, examples: [metadata], const: metadata });
+});
+
+test("fails fast instead of guessing at a tuple rewrite that isn't provably safe", () => {
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "string" }, { type: "number" }],
+    minItems: 2,
+    maxItems: 2
+  })).toThrow('tuple-form "items"');
+
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }]
+  })).toThrow('tuple-form "items"');
+
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 0,
+    maxItems: 2
+  })).toThrow('tuple-form "items"');
+
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 2,
+    additionalItems: { type: "string" }
+  })).toThrow('tuple-form "items"');
+
+  expect(() => toCodexCompatibleSchema({
+    type: "array",
+    items: [{ type: "number" }, { type: "number" }],
+    minItems: 2,
+    maxItems: 1,
+    additionalItems: false
+  })).toThrow('tuple-form "items"');
+
+  expect(() => toCodexCompatibleSchema({
+    type: "object",
+    properties: {
+      coords: { type: "array", items: [{ type: "string" }, { type: "number" }] }
+    }
+  })).toThrow('tuple-form "items"');
+});
+
+test("names the offending tool and never dispatches an unsupported schema to codex app-server", async () => {
+  // Regression test for the review finding on the first version of this fix: a
+  // heterogeneous or open-ended tuple must fail the turn locally — naming the tool —
+  // instead of either being silently mistranslated or forwarded to codex app-server.
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
+  const fakeCodex = join(directory, "codex");
+  const capturedThreadStart = join(directory, "thread-start.json");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "thread/start") {
+    writeFileSync(${JSON.stringify(capturedThreadStart)}, JSON.stringify(message.params));
+    send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+
+  try {
+    let caught: unknown;
+    try {
+      await runCodex(chatRequestSchema.parse({
+        model: "test",
+        messages: [{ role: "user", content: "set the region" }],
+        tools: [{
+          type: "function",
+          function: {
+            name: "set_media_region",
+            parameters: {
+              type: "object",
+              properties: {
+                coords: { type: "array", items: [{ type: "string" }, { type: "number" }] }
+              }
+            }
+          }
+        }]
+      }));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('Codex tool "set_media_region"');
+    expect((caught as Error).message).toContain("unsupported parameter schema");
+
+    // The capture file is only ever written by the fake codex's thread/start handler, so
+    // its absence proves the request never reached the app-server RPC layer.
+    await expect(readFile(capturedThreadStart, "utf8")).rejects.toThrow();
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("sends a codex-compatible dynamicTools schema over the wire for a length-pinned tuple", async () => {
+  // Regression test for: codex app-server rejected the whole thread/start request with
+  // `dynamic tool input schema is not supported for set_media_region: invalid type: map,
+  // expected a string` whenever a tool's JSON Schema used tuple-form `items` (an array of
+  // per-position schemas) — the exact shape zod-to-json-schema emits for a plain zod
+  // tuple. This spawns a fake codex that captures the raw thread/start params to a file,
+  // so the assertion covers what actually goes out over the app-server RPC wire — not
+  // just the pure toCodexCompatibleSchema unit above.
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-test-"));
+  const fakeCodex = join(directory, "codex");
+  const capturedThreadStart = join(directory, "thread-start.json");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "thread/start") {
+    writeFileSync(${JSON.stringify(capturedThreadStart)}, JSON.stringify(message.params));
+    send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1" } } });
+    send({ method: "item/agentMessage/delta", params: { delta: "done" } });
+    send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+
+  try {
+    await runCodex(chatRequestSchema.parse({
+      model: "test",
+      messages: [{ role: "user", content: "set the region" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "set_media_region",
+          parameters: {
+            type: "object",
+            properties: {
+              coords: {
+                type: "array",
+                items: [
+                  { type: "number" },
+                  { type: "number" },
+                  { type: "number" },
+                  { type: "number" }
+                ],
+                minItems: 4,
+                maxItems: 4
+              }
+            }
+          }
+        }
+      }]
+    }));
+
+    const params = JSON.parse(await readFile(capturedThreadStart, "utf8"));
+    expect(params.dynamicTools).toEqual([{
+      type: "function",
+      name: "set_media_region",
+      description: "",
+      inputSchema: {
+        type: "object",
+        properties: {
+          coords: {
+            type: "array",
+            items: { type: "number" },
+            minItems: 4,
+            maxItems: 4
+          }
+        }
+      }
+    }]);
   } finally {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
