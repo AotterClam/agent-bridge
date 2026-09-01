@@ -240,6 +240,19 @@ function toolCalls(turn: ChatTurn) {
   }));
 }
 
+/**
+ * Shared error body for both streaming lanes. A stream has already sent its
+ * HTTP status by the time a turn fails, so `category` is how a standard
+ * classification — notably `auth_required` — reaches a host on this path.
+ */
+export function errorPayload(error: unknown) {
+  const category = (error as { category?: unknown } | null)?.category;
+  return {
+    message: error instanceof Error ? error.message : "Bridge failed",
+    ...(typeof category === "string" ? { category } : {})
+  };
+}
+
 export async function respond(
   input: ChatRequest,
   runner: ChatRunner,
@@ -293,11 +306,7 @@ export async function respond(
         .catch((error) =>
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({
-                error: {
-                  message: error instanceof Error ? error.message : "Bridge failed"
-                }
-              })}\n\n`
+              `data: ${JSON.stringify({ error: errorPayload(error) })}\n\n`
             )
           )
         )

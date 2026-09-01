@@ -157,6 +157,10 @@ function command() {
   return resolveCommand(process.env.AGENT_BRIDGE_CODEX_COMMAND ?? "codex");
 }
 
+// The reconnect lane spawns `codex login` and `codex login status`, and must
+// resolve the same executable the turn lane runs.
+export { command as codexCommand };
+
 function resolveCommand(cmd: string): string {
   if (process.env.AGENT_BRIDGE_CODEX_COMMAND) return process.env.AGENT_BRIDGE_CODEX_COMMAND;
   const home = homedir();
