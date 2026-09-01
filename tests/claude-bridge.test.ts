@@ -19,6 +19,27 @@ const input = {
   tool_choice: "auto"
 };
 
+const ARTIFACT_ID = "0d92c89d-2e5b-4f7e-934b-421f24785566";
+const artifactTool = {
+  type: "function" as const,
+  function: {
+    name: "lookup",
+    parameters: {
+      type: "object",
+      properties: {
+        artifactId: {
+          type: "string",
+          format: "uuid",
+          pattern:
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        }
+      },
+      required: ["artifactId"],
+      additionalProperties: false
+    }
+  }
+};
+
 function abortedQuery({ options }: any) {
   return Object.assign(
     (async function* () {
@@ -205,6 +226,108 @@ test("keeps the lumen-next OpenAI streaming contract", async () => {
   expect(text).toContain("data: [DONE]");
 });
 
+test("passes the caller's JSON Schema unchanged to Claude", async () => {
+  let listedSchema: unknown;
+  await runClaudeTurn(
+    chatRequestSchema.parse({
+      ...input,
+      tools: [artifactTool]
+    }),
+    {
+      queryFn: ({ options }: any) =>
+        Object.assign(
+          (async function* () {
+            const listTools =
+              options.mcpServers.openai.instance.server._requestHandlers.get(
+                "tools/list"
+              );
+            const listed = await listTools(
+              { method: "tools/list", params: {} },
+              {}
+            );
+            listedSchema = listed.tools[0].inputSchema;
+            yield {
+              type: "assistant",
+              parent_tool_use_id: null,
+              message: { content: [{ type: "text", text: "ok" }] }
+            };
+          })(),
+          { close() {} }
+        )
+    }
+  );
+  expect(listedSchema).toEqual(artifactTool.function.parameters);
+});
+
+test("keeps a streamed UUID tool argument valid JSON", async () => {
+  const runner = createClaudeRunner({
+    queryFn: () =>
+      Object.assign(
+        (async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "tool_use",
+                id: "toolu_uuid",
+                name: "mcp__openai__lookup",
+                input: {}
+              }
+            }
+          };
+          for (const partial_json of [
+            '{"artifactId":',
+            `"${ARTIFACT_ID}`,
+            '"}'
+          ]) {
+            yield {
+              type: "stream_event",
+              event: {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "input_json_delta", partial_json }
+              }
+            };
+          }
+          yield {
+            type: "assistant",
+            parent_tool_use_id: null,
+            message: {
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_uuid",
+                  name: "mcp__openai__lookup",
+                  input: { artifactId: ARTIFACT_ID }
+                }
+              ]
+            }
+          };
+        })(),
+        { close() {} }
+      )
+  });
+  const response = await respond(
+    chatRequestSchema.parse({
+      ...input,
+      stream: true,
+      tools: [artifactTool]
+    }),
+    runner as ChatRunner
+  );
+  const chunks = (await response.text())
+    .split("\n\n")
+    .filter((chunk) => chunk.startsWith("data: {"))
+    .map((chunk) => JSON.parse(chunk.slice(6)));
+  const argumentsJson = chunks
+    .flatMap((chunk) => chunk.choices[0].delta.tool_calls ?? [])
+    .map((call) => call.function?.arguments ?? "")
+    .join("");
+  expect(JSON.parse(argumentsJson)).toEqual({ artifactId: ARTIFACT_ID });
+});
+
 test("re-emits content and tool calls the SDK resolved without streaming", async () => {
   const runner = createClaudeRunner({
     queryFn: () =>
@@ -216,7 +339,12 @@ test("re-emits content and tool calls the SDK resolved without streaming", async
             message: {
               content: [
                 { type: "text", text: "calling" },
-                { type: "tool_use", id: "toolu_1", name: "mcp__openai__lookup", input: { q: 1 } }
+                {
+                  type: "tool_use",
+                  id: "toolu_1",
+                  name: "mcp__openai__lookup",
+                  input: { artifactId: ARTIFACT_ID }
+                }
               ]
             }
           };
@@ -229,11 +357,17 @@ test("re-emits content and tool calls the SDK resolved without streaming", async
     chatRequestSchema.parse({
       model: "claude-sonnet",
       messages: [{ role: "user", content: "Hello" }],
-      tools: [{ type: "function", function: { name: "lookup" } }]
+      tools: [artifactTool]
     }),
     { onDelta: (delta: ChatDelta) => deltas.push(delta) }
   );
-  expect(turn.toolCalls).toEqual([{ id: "toolu_1", name: "lookup", arguments: { q: 1 } }]);
+  expect(turn.toolCalls).toEqual([
+    {
+      id: "toolu_1",
+      name: "lookup",
+      arguments: { artifactId: ARTIFACT_ID }
+    }
+  ]);
   expect(turn.finishReason).toBe("tool_calls");
   expect(JSON.stringify(deltas)).toContain('"content":"calling"');
   expect(JSON.stringify(deltas)).toContain('"name":"lookup"');
