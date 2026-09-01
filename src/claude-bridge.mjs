@@ -133,6 +133,30 @@ function prepareTools(input) {
   }
 }
 
+function preserveToolSchemas(mcpServer, tools) {
+  const schemas = new Map(
+    tools.map(({ function: definition }) => [
+      definition.name,
+      definition.parameters ?? { type: "object", properties: {} },
+    ]),
+  );
+  // ponytail: the pinned SDK has no public raw-JSON-Schema hook; remove this
+  // wrapper when it does, with the tools/list regression test as the check.
+  const handlers = mcpServer.instance?.server?._requestHandlers;
+  const listTools = handlers?.get("tools/list");
+  if (typeof listTools !== "function") {
+    throw new Error("Claude SDK no longer exposes its tools/list handler");
+  }
+  handlers.set("tools/list", async (...args) => {
+    const result = await listTools(...args);
+    for (const tool of result.tools) {
+      if (schemas.has(tool.name)) tool.inputSchema = schemas.get(tool.name);
+    }
+    return result;
+  });
+  return mcpServer;
+}
+
 async function* structuredPrompt(input) {
   const content = [{ type: "text", text: promptFor(input.messages, input.tool_choice) }];
   for (const image of imageInputs(input)) {
@@ -250,12 +274,15 @@ export async function runClaudeTurn(input, options = {}) {
   const tools = prepared.selected;
   const sdkTools = prepared.sdk;
   const mcpServer = sdkTools.length
-    ? createSdkMcpServer({
-        name: "openai",
-        version: "0.0.0",
-        tools: sdkTools,
-        alwaysLoad: true,
-      })
+    ? preserveToolSchemas(
+        createSdkMcpServer({
+          name: "openai",
+          version: "0.0.0",
+          tools: sdkTools,
+          alwaysLoad: true,
+        }),
+        tools,
+      )
     : undefined;
   const controller = new AbortController();
   const timeoutMs = turnTimeoutMs(options.timeoutMs);
