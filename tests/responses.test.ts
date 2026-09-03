@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import type { ChatRunner, ChatTurn } from "../src/protocol.js";
+import { expect, jest, test } from "bun:test";
+import { SSE_HEARTBEAT_MS, type ChatRunner, type ChatTurn } from "../src/protocol.js";
 import {
   respondResponses,
   responsesRequestSchema,
@@ -261,6 +261,21 @@ test("terminates the stream with a [DONE] marker", async () => {
   const response = await respondResponses(request({ stream: true }), runner);
   const text = await response.text();
   expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+});
+
+test("keeps a silent Responses stream alive", async () => {
+  jest.useFakeTimers();
+  let finish!: (turn: ChatTurn) => void;
+  const runner: ChatRunner = () => new Promise((resolve) => { finish = resolve; });
+  try {
+    const response = await respondResponses(request({ stream: true }), runner);
+    jest.advanceTimersByTime(SSE_HEARTBEAT_MS);
+    finish({ content: "done", toolCalls: [], finishReason: "stop" });
+    expect(await response.text()).toContain(": ping\n\n");
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test("streams semantic events across reasoning, text, and tool calls", async () => {

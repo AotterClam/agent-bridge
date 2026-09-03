@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, jest, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,8 @@ import {
 import {
   chatRequestSchema,
   respond,
+  SSE_HEARTBEAT_MS,
+  startSseHeartbeat,
   selectedTools,
   type ChatRunner,
   type ChatTurn
@@ -121,6 +123,40 @@ test("returns a model turn that does not follow tool_choice", async () => {
   expect(body).toContain("data: [DONE]");
 });
 
+test("keeps a silent Chat Completions stream alive", async () => {
+  jest.useFakeTimers();
+  let finish!: (turn: ChatTurn) => void;
+  const runner: ChatRunner = () => new Promise((resolve) => { finish = resolve; });
+  try {
+    const response = await respond({ ...namedChoice, stream: true }, runner);
+    jest.advanceTimersByTime(SSE_HEARTBEAT_MS);
+    finish({ content: "done", toolCalls: [], finishReason: "stop" });
+    expect(await response.text()).toContain(": ping\n\n");
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("resets and stops the SSE heartbeat on real output", () => {
+  jest.useFakeTimers();
+  const chunks: string[] = [];
+  try {
+    const heartbeat = startSseHeartbeat((chunk) => chunks.push(chunk));
+    jest.advanceTimersByTime(SSE_HEARTBEAT_MS - 1);
+    heartbeat.reset();
+    jest.advanceTimersByTime(SSE_HEARTBEAT_MS - 1);
+    expect(chunks).toEqual([]);
+    jest.advanceTimersByTime(1);
+    expect(chunks).toEqual([": ping\n\n"]);
+    heartbeat.stop();
+    jest.advanceTimersByTime(SSE_HEARTBEAT_MS);
+    expect(chunks).toHaveLength(1);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
 test("still rejects an unknown named tool before execution", () => {
   expect(() => selectedTools({
     ...namedChoice,
@@ -221,6 +257,72 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         ]
       }]
     }))).toMatchObject({ content: "vision", finishReason: "stop" });
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("reaps repeated Codex process trees after completion and abort", async () => {
+  if (process.platform === "win32") return;
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-process-tree-"));
+  const fakeCodex = join(directory, "codex");
+  const pidsPath = join(directory, "pids");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+  stdio: "ignore"
+});
+appendFileSync(${JSON.stringify(pidsPath)}, process.pid + "," + descendant.pid + "\\n");
+process.on("SIGTERM", () => {});
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1" } } });
+    if (!message.params.input[0].text.includes("abort")) {
+      send({ method: "item/agentMessage/delta", params: { delta: "done" } });
+      send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    }
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+
+  try {
+    for (let index = 0; index < 3; index++) {
+      await runCodex(chatRequestSchema.parse({
+        model: "test",
+        messages: [{ role: "user", content: `complete ${index}` }]
+      }));
+    }
+    const controller = new AbortController();
+    const aborted = runCodex(
+      chatRequestSchema.parse({
+        model: "test",
+        messages: [{ role: "user", content: "abort" }]
+      }),
+      { signal: controller.signal }
+    );
+    controller.abort();
+    await expect(aborted).rejects.toThrow("aborted");
+    await closeCodexSessions();
+
+    const pids = (await readFile(pidsPath, "utf8"))
+      .trim()
+      .split(/[\n,]/)
+      .map(Number);
+    expect(pids).toHaveLength(8);
+    for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
   } finally {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;

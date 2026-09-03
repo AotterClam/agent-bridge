@@ -253,6 +253,30 @@ export function errorPayload(error: unknown) {
   };
 }
 
+export const SSE_HEARTBEAT_MS = 15_000;
+
+export function startSseHeartbeat(send: (chunk: string) => void) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stop = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  const reset = () => {
+    stop();
+    timer = setTimeout(() => {
+      try {
+        send(": ping\n\n");
+        reset();
+      } catch {
+        stop();
+      }
+    }, SSE_HEARTBEAT_MS);
+    timer.unref();
+  };
+  reset();
+  return { reset, stop };
+}
+
 export async function respond(
   input: ChatRequest,
   runner: ChatRunner,
@@ -283,9 +307,16 @@ export async function respond(
   }
 
   const encoder = new TextEncoder();
+  let heartbeat: ReturnType<typeof startSseHeartbeat> | undefined;
+  let canceled = false;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      const send = (delta: ChatDelta, finishReason: ChatTurn["finishReason"] | null, turn?: ChatTurn) =>
+      const send = (
+        delta: ChatDelta,
+        finishReason: ChatTurn["finishReason"] | null,
+        turn?: ChatTurn
+      ) => {
+        if (canceled) return;
         controller.enqueue(
           encoder.encode(
             `data: ${JSON.stringify({
@@ -298,22 +329,34 @@ export async function respond(
             })}\n\n`
           )
         );
+        heartbeat?.reset();
+      };
+      heartbeat = startSseHeartbeat((chunk) =>
+        controller.enqueue(encoder.encode(chunk))
+      );
       send({ role: "assistant" } as ChatDelta, null);
       void runner(input, { signal, onDelta: (delta) => send(delta, null) })
         .then((turn) => {
           send({}, turn.finishReason, turn);
         })
-        .catch((error) =>
+        .catch((error) => {
+          if (canceled) return;
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify({ error: errorPayload(error) })}\n\n`
             )
-          )
-        )
+          );
+        })
         .finally(() => {
+          heartbeat?.stop();
+          if (canceled) return;
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         });
+    },
+    cancel() {
+      canceled = true;
+      heartbeat?.stop();
     }
   });
   return new Response(body, {

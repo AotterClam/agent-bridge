@@ -35,6 +35,7 @@ import {
 const exec = promisify(execFile);
 const REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
 const DEFAULT_CODEX_TURN_TIMEOUT_MS = 300_000;
+const CODEX_SHUTDOWN_GRACE_MS = 1_000;
 
 type RpcMessage = {
   id?: number | string;
@@ -48,6 +49,47 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
     : {};
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function processTreeRunning(child: ChildProcessWithoutNullStreams) {
+  if (child.pid == null) return false;
+  if (process.platform === "win32") {
+    return child.exitCode == null && child.signalCode == null;
+  }
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return String(record(error).code) !== "ESRCH";
+  }
+}
+
+function signalProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals) {
+  if (process.platform !== "win32" && child.pid != null) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if (String(record(error).code) === "ESRCH") return;
+    }
+  }
+  child.kill(signal);
+}
+
+async function waitForProcessTree(child: ChildProcessWithoutNullStreams) {
+  const deadline = Date.now() + CODEX_SHUTDOWN_GRACE_MS;
+  while (processTreeRunning(child) && Date.now() < deadline) await wait(20);
+}
+
+async function stopCodexProcess(child: ChildProcessWithoutNullStreams) {
+  if (!processTreeRunning(child)) return;
+  signalProcessTree(child, "SIGTERM");
+  await waitForProcessTree(child);
+  if (!processTreeRunning(child)) return;
+  signalProcessTree(child, "SIGKILL");
+  await waitForProcessTree(child);
 }
 
 function isPinnedTupleLength(obj: Record<string, unknown>, length: number): boolean {
@@ -383,7 +425,6 @@ async function probeCodexImageCapabilities(
   let stderr = "";
   const timeout = setTimeout(() => {
     client?.close(new Error("Codex image capability probe timed out"));
-    child?.kill("SIGTERM");
   }, 10_000);
   timeout.unref();
   try {
@@ -411,7 +452,8 @@ async function probeCodexImageCapabilities(
       {
         cwd,
         env: { ...codexEnvironment(cwd), CODEX_HOME: isolatedCodexHome },
-        stdio: ["pipe", "pipe", "pipe"]
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32"
       }
     );
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
@@ -438,7 +480,7 @@ async function probeCodexImageCapabilities(
   } finally {
     clearTimeout(timeout);
     client?.close();
-    if (child && !child.killed) child.kill("SIGTERM");
+    if (child) await stopCodexProcess(child);
     await rm(cwd, { recursive: true, force: true });
   }
 }
@@ -665,7 +707,12 @@ class CodexSession {
         "app-server",
         "--stdio"
       ],
-      { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+      {
+        cwd,
+        env: codexEnvironment(cwd),
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32"
+      }
     );
     const session = new CodexSession(cwd, child);
     sessions.add(session);
@@ -852,10 +899,15 @@ class CodexSession {
     waiter?.reject(error);
     if (this.pending) pendingCalls.delete(this.pending.callId);
     this.pending = undefined;
-    sessions.delete(this);
     this.client.close(error);
-    if (!this.child.killed) this.child.kill("SIGTERM");
-    this.cleanup = rm(this.cwd, { recursive: true, force: true });
+    this.cleanup = (async () => {
+      try {
+        await stopCodexProcess(this.child);
+        await rm(this.cwd, { recursive: true, force: true });
+      } finally {
+        sessions.delete(this);
+      }
+    })();
     return this.cleanup;
   }
 }
@@ -896,7 +948,12 @@ export const runCodexImage: ImageRunner = async (input, options = {}) => {
       "app-server",
       "--stdio"
     ],
-    { cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"] }
+    {
+      cwd,
+      env: codexEnvironment(cwd),
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32"
+    }
   );
   let stderr = "";
   let threadDirectory: string | undefined;
@@ -922,16 +979,7 @@ export const runCodexImage: ImageRunner = async (input, options = {}) => {
     if (timeout) clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abort);
     client.close(error);
-    if (child.exitCode == null && child.signalCode == null) {
-      let closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
-      child.kill("SIGTERM");
-      await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-      if (child.exitCode == null && child.signalCode == null) {
-        closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
-        child.kill("SIGKILL");
-        await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-      }
-    }
+    await stopCodexProcess(child);
     await rm(cwd, { recursive: true, force: true });
     if (removeThreadDirectory && verifiedSavedPath) {
       await rm(verifiedSavedPath, { force: true });
