@@ -35,6 +35,7 @@ import {
 const exec = promisify(execFile);
 const REASONING = new Set(["low", "medium", "high", "xhigh", "max"]);
 const DEFAULT_CODEX_TURN_TIMEOUT_MS = 300_000;
+const DEFAULT_CODEX_HANDSHAKE_TIMEOUT_MS = 60_000;
 const CODEX_SHUTDOWN_GRACE_MS = 1_000;
 
 type RpcMessage = {
@@ -229,6 +230,30 @@ export function codexTurnTimeoutMs(
     throw new Error("AGENT_BRIDGE_CODEX_TIMEOUT_MS must be a positive integer");
   }
   return timeout;
+}
+
+export function codexHandshakeTimeoutMs(
+  value = process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS
+) {
+  if (value === undefined) return DEFAULT_CODEX_HANDSHAKE_TIMEOUT_MS;
+  const timeout = Number(value);
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+    throw new Error(
+      "AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS must be a positive integer"
+    );
+  }
+  return timeout;
+}
+
+function codexHandshakeError(reason: "aborted" | "timeout", timeoutMs?: number) {
+  return Object.assign(
+    new Error(
+      reason === "timeout"
+        ? `Codex handshake timed out after ${timeoutMs} ms.`
+        : "Codex handshake aborted."
+    ),
+    { phase: "handshake", reason, ...(timeoutMs ? { timeoutMs } : {}) }
+  );
 }
 
 export function completedCodexTurn(
@@ -692,7 +717,9 @@ class CodexSession {
     });
   }
 
-  static async create(input: ChatRequest) {
+  static async create(input: ChatRequest, options: RunOptions) {
+    if (options.signal?.aborted) throw codexHandshakeError("aborted");
+    const timeoutMs = codexHandshakeTimeoutMs();
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
     const child = spawn(
       command(),
@@ -716,6 +743,15 @@ class CodexSession {
     );
     const session = new CodexSession(cwd, child);
     sessions.add(session);
+    const abort = () => {
+      void session.close(codexHandshakeError("aborted"));
+    };
+    const timeout = setTimeout(() => {
+      void session.close(codexHandshakeError("timeout", timeoutMs));
+    }, timeoutMs);
+    timeout.unref();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
     try {
       await session.initialize(input);
       return session;
@@ -723,6 +759,9 @@ class CodexSession {
       const failure = error instanceof Error ? error : new Error("Codex initialization failed");
       await session.close(failure);
       throw failure;
+    } finally {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -922,7 +961,7 @@ export async function closeCodexSessions() {
 export const runCodex: ChatRunner = async (input, options = {}) => {
   const pending = pendingResult(input);
   if (pending) await pending.close();
-  const session = await CodexSession.create(input);
+  const session = await CodexSession.create(input, options);
   return session.start(input, options);
 };
 

@@ -247,9 +247,11 @@ function toolCalls(turn: ChatTurn) {
  */
 export function errorPayload(error: unknown) {
   const category = (error as { category?: unknown } | null)?.category;
+  const phase = (error as { phase?: unknown } | null)?.phase;
   return {
     message: error instanceof Error ? error.message : "Bridge failed",
-    ...(typeof category === "string" ? { category } : {})
+    ...(typeof category === "string" ? { category } : {}),
+    ...(typeof phase === "string" ? { phase } : {})
   };
 }
 

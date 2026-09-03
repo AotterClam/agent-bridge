@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   closeCodexSessions,
   codexEnvironment,
+  codexHandshakeTimeoutMs,
   codexTurnTimeoutMs,
   completedCodexTurn,
   recoverTextToolCall,
@@ -66,6 +67,11 @@ test("validates Codex turn completion and timeout configuration", () => {
   expect(codexTurnTimeoutMs("450000")).toBe(450_000);
   expect(() => codexTurnTimeoutMs("0")).toThrow(
     "AGENT_BRIDGE_CODEX_TIMEOUT_MS must be a positive integer"
+  );
+  expect(codexHandshakeTimeoutMs(undefined)).toBe(60_000);
+  expect(codexHandshakeTimeoutMs("45000")).toBe(45_000);
+  expect(() => codexHandshakeTimeoutMs("0")).toThrow(
+    "AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS must be a positive integer"
   );
 });
 
@@ -313,6 +319,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       }),
       { signal: controller.signal }
     );
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const runs = (await readFile(pidsPath, "utf8").catch(() => ""))
+        .trim()
+        .split("\n")
+        .filter(Boolean).length;
+      if (runs === 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     controller.abort();
     await expect(aborted).rejects.toThrow("aborted");
     await closeCodexSessions();
@@ -327,6 +341,110 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
     else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("bounds and aborts both Codex handshake phases", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-bridge-handshake-"));
+  const fakeCodex = join(directory, "codex");
+  const modePath = join(directory, "mode");
+  const eventsPath = join(directory, "events");
+  const originalCommand = process.env.AGENT_BRIDGE_CODEX_COMMAND;
+  const originalHandshakeTimeout = process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS;
+  const originalTurnTimeout = process.env.AGENT_BRIDGE_CODEX_TIMEOUT_MS;
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const mode = readFileSync(${JSON.stringify(modePath)}, "utf8");
+appendFileSync(${JSON.stringify(eventsPath)}, mode + ":pid:" + process.pid + "\\n");
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  appendFileSync(${JSON.stringify(eventsPath)}, mode + ":" + message.method + "\\n");
+  if (message.method === "initialize") {
+    if (mode === "exit") process.exit(7);
+    if (mode !== "initialize") send({ id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    if (mode !== "thread") send({ id: message.id, result: { thread: { id: "thread-1" } } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1" } } });
+  }
+});
+`);
+  await chmod(fakeCodex, 0o755);
+  process.env.AGENT_BRIDGE_CODEX_COMMAND = fakeCodex;
+  const input = chatRequestSchema.parse({
+    model: "test",
+    messages: [{ role: "user", content: "hello" }]
+  });
+  const waitFor = async (event: string) => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if ((await readFile(eventsPath, "utf8").catch(() => "")).includes(event)) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`Fake Codex never reached ${event}`);
+  };
+  const latestPid = async (mode: string) => {
+    const match = (await readFile(eventsPath, "utf8"))
+      .split("\n")
+      .reverse()
+      .find((line) => line.startsWith(`${mode}:pid:`));
+    return Number(match?.split(":").at(-1));
+  };
+  const expectStopped = async (mode: string) => {
+    const pid = await latestPid(mode);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  };
+
+  try {
+    await writeFile(modePath, "pre-aborted");
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await expect(runCodex(input, { signal: preAborted.signal }))
+      .rejects.toThrow("Codex handshake aborted.");
+    expect(await readFile(eventsPath, "utf8").catch(() => "")).toBe("");
+
+    process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS = "500";
+    for (const mode of ["initialize", "thread"]) {
+      await writeFile(modePath, mode);
+      const response = await respond({ ...input, stream: true }, runCodex);
+      const body = await response.text();
+      expect(body).toContain("Codex handshake timed out after 500 ms.");
+      expect(body).toContain('"phase":"handshake"');
+      expect(body.trimEnd().endsWith("data: [DONE]")).toBe(true);
+      await expectStopped(mode);
+    }
+
+    process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS = "10000";
+    for (const [mode, phase] of [["initialize", "initialize"], ["thread", "thread/start"]]) {
+      await writeFile(modePath, mode);
+      const controller = new AbortController();
+      const turn = runCodex(input, { signal: controller.signal });
+      await waitFor(`${mode}:${phase}`);
+      controller.abort();
+      await expect(turn).rejects.toThrow("Codex handshake aborted.");
+      await expectStopped(mode);
+    }
+
+    await writeFile(modePath, "exit");
+    await expect(runCodex(input)).rejects.toThrow("Codex exited 7");
+    await expectStopped("exit");
+
+    await writeFile(modePath, "turn");
+    process.env.AGENT_BRIDGE_CODEX_TIMEOUT_MS = "30";
+    await expect(runCodex(input)).rejects.toThrow("Codex turn timed out after 30 ms.");
+    await closeCodexSessions();
+    await expectStopped("turn");
+  } finally {
+    await closeCodexSessions();
+    if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;
+    else process.env.AGENT_BRIDGE_CODEX_COMMAND = originalCommand;
+    if (originalHandshakeTimeout == null) delete process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS;
+    else process.env.AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS = originalHandshakeTimeout;
+    if (originalTurnTimeout == null) delete process.env.AGENT_BRIDGE_CODEX_TIMEOUT_MS;
+    else process.env.AGENT_BRIDGE_CODEX_TIMEOUT_MS = originalTurnTimeout;
     await rm(directory, { recursive: true, force: true });
   }
 }, 10_000);

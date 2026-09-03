@@ -593,7 +593,16 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       } catch (error) {
         // Streaming lanes settle their own errors inside the SSE body and
         // never reach the request catch, so classification happens here too.
-        throw await classifyTurnFailure(adapterId, error, true);
+        const classified = await classifyTurnFailure(adapterId, error, true);
+        const phase = record(classified).phase;
+        if (typeof phase === "string") {
+          logger.warn(`adapter.${adapterId}`, `${adapterId} ${phase} failed`, {
+            phase,
+            reason: record(classified).reason,
+            timeoutMs: record(classified).timeoutMs
+          });
+        }
+        throw classified;
       }
     };
   const markImageSupported = (
