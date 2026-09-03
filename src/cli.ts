@@ -75,6 +75,7 @@ ${c.bold("Environment Variables:")}
   AGENT_BRIDGE_GROK_COMMAND           Path to Grok CLI executable (default: grok)
   AGENT_BRIDGE_ANTIGRAVITY_TIMEOUT_MS Antigravity turn timeout in ms (default: 300000)
   AGENT_BRIDGE_CLAUDE_TIMEOUT_MS      Claude turn timeout in ms (default: 300000)
+  AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS Codex handshake timeout in ms (default: 60000)
   AGENT_BRIDGE_CODEX_TIMEOUT_MS       Codex turn timeout in ms (default: 300000)
   AGENT_BRIDGE_GROK_TIMEOUT_MS        Grok turn timeout in ms (default: 300000)
   AGENT_BRIDGE_RECONNECT_TIMEOUT_MS   Reconnect login timeout in ms (default: 300000)

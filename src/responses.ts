@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   chatRequestSchema,
   errorPayload,
+  startSseHeartbeat,
   type ChatDelta,
   type ChatRequest,
   type ChatRunner,
@@ -470,10 +471,13 @@ export async function respondResponses(
   }
 
   const encoder = new TextEncoder();
+  let heartbeat: ReturnType<typeof startSseHeartbeat> | undefined;
+  let canceled = false;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       let sequence = 0;
-      const send = (type: string, payload: Record<string, unknown>) =>
+      const send = (type: string, payload: Record<string, unknown>) => {
+        if (canceled) return;
         controller.enqueue(
           encoder.encode(
             `event: ${type}\ndata: ${JSON.stringify({
@@ -483,6 +487,8 @@ export async function respondResponses(
             })}\n\n`
           )
         );
+        heartbeat?.reset();
+      };
 
       type Open =
         | { kind: "message"; id: string; text: string }
@@ -658,6 +664,9 @@ export async function respondResponses(
         }
       };
 
+      heartbeat = startSseHeartbeat((chunk) =>
+        controller.enqueue(encoder.encode(chunk))
+      );
       send(
         "response.created",
         { response: responsePayload(context, "in_progress", []) }
@@ -704,9 +713,15 @@ export async function respondResponses(
           });
         })
         .finally(() => {
+          heartbeat?.stop();
+          if (canceled) return;
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         });
+    },
+    cancel() {
+      canceled = true;
+      heartbeat?.stop();
     }
   });
   return new Response(body, {

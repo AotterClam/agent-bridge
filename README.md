@@ -619,6 +619,7 @@ Honest limits of this lane:
 | `AGENT_BRIDGE_CLAUDE_TIMEOUT_MS` | `300000` | Claude turn timeout |
 | `AGENT_BRIDGE_CLAUDE_COMMAND` | `claude` | Claude CLI executable, used by reconnect only |
 | `AGENT_BRIDGE_CODEX_TIMEOUT_MS` | `300000` | Codex turn timeout |
+| `AGENT_BRIDGE_CODEX_HANDSHAKE_TIMEOUT_MS` | `60000` | Combined Codex `initialize` + `thread/start` timeout |
 | `AGENT_BRIDGE_CODEX_COMMAND` | `codex` | Codex executable |
 | `AGENT_BRIDGE_GROK_TIMEOUT_MS` | `300000` | Grok turn timeout |
 | `AGENT_BRIDGE_GROK_COMMAND` | `grok` | Grok executable |
