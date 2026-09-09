@@ -326,7 +326,17 @@ export async function runClaudeTurn(input, options = {}) {
       if (item.type === "stream_event") {
         options.onEvent?.(item.event);
       } else if (item.type === "assistant" && item.parent_tool_use_id == null) {
-        if (item.error) throw new Error(`Claude bridge failed: ${item.error}`);
+        if (item.error) {
+          const statuses = {
+            authentication_failed: 401, oauth_org_not_allowed: 403, billing_error: 402,
+            rate_limit: 429, overloaded: 503, invalid_request: 400, model_not_found: 404
+          };
+          const message = (item.message?.content ?? [])
+            .filter((part) => part.type === "text").map((part) => part.text).join("\n");
+          throw Object.assign(new Error(message || `Claude bridge failed: ${item.error}`), {
+            status: statuses[item.error] ?? 500, code: item.error
+          });
+        }
         // One Claude API turn can emit several assistant messages (for
         // example, a thinking block followed by a tool-use block).
         const next = assistantTurn(item);

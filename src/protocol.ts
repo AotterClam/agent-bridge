@@ -245,13 +245,35 @@ function toolCalls(turn: ChatTurn) {
  * HTTP status by the time a turn fails, so `category` is how a standard
  * classification — notably `auth_required` — reaches a host on this path.
  */
-export function errorPayload(error: unknown) {
+export function errorStatus(error: unknown) {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599
+    ? status : 500;
+}
+
+export function errorCategory(error: unknown, status = errorStatus(error)) {
   const category = (error as { category?: unknown } | null)?.category;
-  const phase = (error as { phase?: unknown } | null)?.phase;
+  if (typeof category === "string") return category;
+  const categories: Record<number, string> = {
+    400: "invalid_request", 401: "unauthorized", 403: "unauthorized", 404: "not_found",
+    409: "conflict", 413: "invalid_request", 422: "invalid_request", 429: "rate_limited"
+  };
+  return categories[status] ?? (status < 500 ? "invalid_request" : "server_error");
+}
+
+export function errorPayload(error: unknown) {
+  const detail = error as { phase?: unknown; type?: unknown; code?: unknown } | null;
+  const status = errorStatus(error);
+  const type = status === 429 ? "rate_limit_error"
+    : status === 401 ? "authentication_error"
+    : status === 403 ? "permission_error"
+    : status < 500 ? "invalid_request_error" : "server_error";
   return {
     message: error instanceof Error ? error.message : "Bridge failed",
-    ...(typeof category === "string" ? { category } : {}),
-    ...(typeof phase === "string" ? { phase } : {})
+    type: typeof detail?.type === "string" ? detail.type : type,
+    code: typeof detail?.code === "string" ? detail.code : type,
+    category: errorCategory(error, status),
+    ...(typeof detail?.phase === "string" ? { phase: detail.phase } : {})
   };
 }
 

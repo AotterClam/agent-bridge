@@ -372,3 +372,16 @@ test("re-emits content and tool calls the SDK resolved without streaming", async
   expect(JSON.stringify(deltas)).toContain('"content":"calling"');
   expect(JSON.stringify(deltas)).toContain('"name":"lookup"');
 });
+
+test("preserves Claude error categories and user-facing details", async () => {
+  for (const [code, status] of [["invalid_request", 400], ["model_not_found", 404], ["rate_limit", 429], ["overloaded", 503]] as const) {
+    let caught: any;
+    try {
+      await runClaudeTurn(input, { queryFn: () => Object.assign((async function* () {
+        yield { type: "assistant", parent_tool_use_id: null, error: code,
+          message: { content: [{ type: "text", text: "Provider error detail" }] } };
+      })(), { close() {} }) });
+    } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ status, code, message: "Provider error detail" });
+  }
+});

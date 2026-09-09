@@ -27,6 +27,9 @@ import {
 } from "./antigravity.js";
 import {
   chatRequestSchema,
+  errorCategory,
+  errorPayload,
+  errorStatus,
   respond,
   type ChatDelta,
   type ChatRunner,
@@ -312,10 +315,10 @@ export function cachedCapabilities(
   load: () => Promise<AdapterCapability[]>
 ) {
   let current: Promise<AdapterCapability[]> | undefined;
-  return (refresh = false) => {
+  return Object.assign((refresh = false) => {
     if (refresh) current = undefined;
     return current ??= load();
-  };
+  }, { invalidate: () => { current = undefined; } });
 }
 
 export function allowsImageRunner(
@@ -417,30 +420,6 @@ function decodePathSegment(value: string) {
       category: "invalid_request"
     });
   }
-}
-
-/**
- * The bridge's provider-neutral error classification, carried as
- * `error.category` on every control-plane and data-plane failure and on both
- * streaming lanes. Hosts switch on this instead of parsing a runtime's error
- * prose, which is the point of the reconnect contract: `auth_required` means
- * "this adapter's sign-in died, offer the reconnect action".
- *
- * The set is closed and consumed downstream — extend it deliberately.
- */
-const CATEGORY_BY_STATUS: Record<number, string> = {
-  400: "invalid_request",
-  401: "unauthorized",
-  404: "not_found",
-  409: "conflict",
-  413: "invalid_request"
-};
-
-function errorCategory(error: unknown, status: number) {
-  const explicit = record(error).category;
-  return typeof explicit === "string"
-    ? explicit
-    : CATEGORY_BY_STATUS[status] ?? "server_error";
 }
 
 const runClaude = createClaudeRunner() as ChatRunner & { close(): void };
@@ -545,12 +524,11 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       detectAntigravity()
     ])
   );
-  // Sign-in state is not cached with discovery: it changes under the bridge
-  // whenever a token expires or a reconnect finishes, while the model catalog
-  // does not. The manager owns its own short cache and invalidates it there.
+  // A successful account change also invalidates the account-scoped catalog.
   const reconnect = createReconnectManager({
     ...options.reconnect,
     onEvent: (event) => {
+      if (event.state === "succeeded") capabilities.invalidate();
       logger.info(
         "reconnect",
         `${event.adapter} reconnect ${event.state}`,
@@ -638,24 +616,31 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     const method = request.method ?? "GET";
     const path = url.pathname;
     const logInfo: Record<string, unknown> = { method, path };
-    response.once("finish", () => {
-      const status = response.statusCode || 200;
+    let logged = false;
+    const logRequest = (canceled = false) => {
+      if (logged) return;
+      logged = true;
+      const status = response.headersSent ? response.statusCode : null;
+      const outcome = canceled ? "canceled" : logInfo.outcome ?? ((status ?? 500) >= 400 ? "failed" : "completed");
       const durationMs = Date.now() - startTime;
       const meta = {
         method,
         path,
         status,
         durationMs,
-        ...logInfo
+        ...logInfo,
+        outcome
       };
-      if (status >= 500) {
+      if (outcome === "failed" && Number(logInfo.errorStatus ?? status) >= 500) {
         logger.error("http", `${method} ${path} ${status}`, meta);
-      } else if (status >= 400) {
+      } else if (outcome !== "completed") {
         logger.warn("http", `${method} ${path} ${status}`, meta);
       } else {
         logger.info("http", `${method} ${path} ${status}`, meta);
       }
-    });
+    };
+    response.once("finish", () => logRequest());
+    response.once("close", () => { if (!response.writableFinished) logRequest(true); });
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { ok: true });
@@ -798,7 +783,22 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
           : adapter === "antigravity"
             ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined }
             : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage };
-    const runTurn = guardedRunner(adapter, runtime.run);
+    const recordFailure = (error: unknown) => {
+      logInfo.outcome = "failed";
+      logInfo.errorStatus = errorStatus(error);
+      logInfo.category = errorCategory(error);
+      logInfo.error = error instanceof Error ? error.message : "Bridge failed";
+    };
+    const runTurn: ChatRunner = async (input, runOptions) => {
+      try {
+        const turn = await guardedRunner(adapter, runtime.run)(input, runOptions);
+        logInfo.outcome = "completed";
+        return turn;
+      } catch (error) {
+        recordFailure(error);
+        throw error;
+      }
+    };
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -985,15 +985,9 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
       if (!parsed.data.stream) markInputSupported(adapterCapability, parsed.data);
     } catch (error) {
       const classified = await classifyTurnFailure(adapter, error);
-      logInfo.error = classified.message;
+      recordFailure(classified);
       if (response.headersSent) return response.end();
-      const status = Number(record(classified).status ?? 500);
-      json(response, status, {
-        error: {
-          message: classified.message,
-          category: errorCategory(classified, status)
-        }
-      });
+      json(response, errorStatus(classified), { error: errorPayload(classified) });
     }
   });
 
