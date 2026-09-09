@@ -188,6 +188,10 @@ test("caches discovery until refresh and fails closed except for Grok live smoke
   expect(loads).toBe(1);
   expect(capabilities(true)).not.toBe(first);
   expect(loads).toBe(2);
+  capabilities.invalidate();
+  expect(loads).toBe(2);
+  await capabilities();
+  expect(loads).toBe(3);
 
   expect(allowsImageRunner("codex", "unknown")).toBe(false);
   expect(allowsImageRunner("antigravity", "unknown")).toBe(false);

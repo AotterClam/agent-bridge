@@ -708,7 +708,7 @@ export async function respondResponses(
               status: "failed",
               // `code` keeps its OpenAI meaning; `category` is the bridge's
               // own standard classification, identical across every lane.
-              error: { code: "server_error", ...errorPayload(error) }
+              error: errorPayload(error)
             }
           });
         })

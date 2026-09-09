@@ -57,7 +57,7 @@ const model = createOpenAICompatible({
 | :--- | :--- | :--- |
 | `antigravity` | Antigravity (Gemini) | Antigravity CLI (`agy`) installed and signed in |
 | `claude` | Claude Code | Claude Code installed and signed in |
-| `codex` | Codex | Codex CLI installed and signed in |
+| `codex` | Codex | Codex CLI 0.147.0+ installed and signed in |
 | `grok` | Grok Build | Grok Build CLI installed and signed in |
 
 *Requires Node.js 22+ or Bun 1.3+.*
@@ -226,6 +226,15 @@ Use `startAgentBridge({ port: 3457 })` only when your host explicitly requires a
 ## Logging & diagnostics (both modes)
 
 Agent Bridge features a unified, multi-transport logging subsystem aligned across both Standalone and Embedded modes.
+
+HTTP logs are emitted once at request completion or client disconnect. `status`
+is the actual HTTP status; `outcome` is `completed`, `failed`, or `canceled`.
+A failed SSE turn retains HTTP 200 and records `outcome: "failed"` with
+`errorStatus`, `category`, and the error message. `durationMs` covers the full
+request lifetime. Count failures by `outcome`, including for streaming clients.
+Disconnect logging uses Node's response-close event; Bun 1.3's HTTP shim does
+not reliably emit that event for an unfinished response. Use the Node CLI when
+you need cancellation accounting.
 
 ### In standalone mode
 
@@ -454,6 +463,25 @@ Images streaming is part of the official OpenAI schema, but the local runtimes c
 
 ### Host capability detection
 
+Codex model discovery uses the signed-in app-server's paginated `model/list`,
+not its bundled catalog. Refresh with `GET /capabilities?refresh=1` after an
+external account change; a successful bridge reconnect invalidates discovery
+automatically. Discovery failures do not fall back to unverified model IDs.
+
+Codex function batches use `experimentalRawEvents` and `rawResponse/completed`
+(available in Codex 0.147.0) to return all calls from one model response before
+the runtime waits for tool results. An internal batch function also lets models
+submit several independent host calls through a single native call. The bridge
+expands it into ordinary `tool_calls` with distinct IDs; it does not execute the
+host functions. Host tools are exposed directly instead of through code-mode.
+The host executes the tools and sends every result with its original call ID
+in the next stateless request; the bridge
+replays that transcript with the current tool list in a fresh session.
+
+`bun run test:codex` is an opt-in live smoke using the signed-in account. It
+checks a two-call batch and replays both dummy results in reverse order. Set
+`AGENT_BRIDGE_CODEX_SMOKE_MODEL` to choose a model from the discovered catalog.
+
 `GET /capabilities` probes the CLI executable installed on the user's host. Its real path and version are returned only as a fingerprint; support is determined from the runtime's own capability response or tool catalog, not a version allowlist. Results are cached for the server lifetime; use `GET /capabilities?refresh=1` after changing a CLI installation.
 
 Each input type and image output operation reports `supported`, `unsupported`, or `unknown` with its probe and evidence. Input cells expose `supported_openai_content_parts`; image output cells expose LiteLLM's `supported_openai_params`. Both include strict `parameter_constraints` and the underlying runtime's unnormalized `provider_capabilities`, so consumers can use portable OpenAI fields without losing provider-specific controls and caveats. The separate top-level `files` cell describes bridge storage rather than pretending it is a native model capability.
@@ -522,10 +550,11 @@ carries `error.category`, a provider-neutral classification a host can switch
 on instead of pattern-matching a runtime's error prose:
 
 `auth_required`, `unsupported`, `conflict`, `invalid_request`, `not_found`,
-`unauthorized`, `server_error`.
+`unauthorized`, `rate_limited`, `server_error`.
 
-`/v1/responses` keeps its OpenAI `error.code` unchanged and adds `category`
-beside it.
+Upstream errors retain their HTTP status and message when available, with
+OpenAI-shaped `type` and `code` fields alongside `category`. Streaming errors
+carry the same classification in the SSE body after HTTP headers are sent.
 
 ### From a failed turn to `authState`
 

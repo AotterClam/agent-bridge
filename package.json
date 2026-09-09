@@ -40,6 +40,7 @@
     "start": "node dist/cli.js",
     "test": "bun test",
     "test:node": "npm run build && node tests/node-smoke.mjs",
+    "test:codex": "bun tests/codex-smoke.mjs",
     "test:grok": "bun tests/grok-smoke.mjs",
     "test:antigravity": "bun tests/antigravity-smoke.mjs"
   },

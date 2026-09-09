@@ -119,7 +119,9 @@ export function createLogger(options: LoggerOptions = {}): BridgeLogger {
       const streamStr = record.meta.stream ? c.dim("(stream)") : "";
       const durationStr = record.meta.durationMs != null ? c.dim(`${record.meta.durationMs}ms`) : "";
       const errorStr = record.meta.error ? c.red(`(${record.meta.error})`) : "";
-      const details = [adapterStr, modelStr, streamStr, errorStr].filter(Boolean).join(" ");
+      const outcomeStr = record.meta.outcome === "failed" ? c.red("(failed)")
+        : record.meta.outcome === "canceled" ? c.yellow("(canceled)") : "";
+      const details = [adapterStr, modelStr, streamStr, outcomeStr, errorStr].filter(Boolean).join(" ");
       return `${c.dim(timeStr)}  ${methodStr} ${pathStr} ${statusStr}  ${details}  ${durationStr}`;
     }
 

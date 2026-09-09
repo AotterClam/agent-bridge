@@ -195,13 +195,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       send({ method: "item/agentMessage/delta", params: { delta: "finished" } });
       send({ method: "turn/completed", params: { turn: { status: "completed" } } });
     } else if (prompt.includes("first result")) {
-      send({ id: 61, method: "item/tool/call", params: {
-        callId: "call-2", tool: "lookup_two", arguments: { key: "beta" }
-      } });
+      send({ method: "rawResponseItem/completed", params: { item: {
+        type: "function_call", call_id: "call-2", name: "lookup_two", arguments: '{"key":"beta"}'
+      } } });
+      send({ method: "rawResponse/completed", params: {} });
     } else {
-      send({ id: 60, method: "item/tool/call", params: {
-        callId: "call-1", tool: "lookup_one", arguments: { key: "alpha" }
-      } });
+      send({ method: "rawResponseItem/completed", params: { item: {
+        type: "function_call", call_id: "call-1", name: "lookup_one", arguments: '{"key":"alpha"}'
+      } } });
+      send({ method: "rawResponse/completed", params: {} });
     }
   }
 });
@@ -703,7 +705,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     }));
 
     const params = JSON.parse(await readFile(capturedThreadStart, "utf8"));
-    expect(params.dynamicTools).toEqual([{
+    expect(params.dynamicTools[0]).toEqual({
       type: "function",
       name: "set_media_region",
       description: "",
@@ -718,7 +720,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
           }
         }
       }
-    }]);
+    });
   } finally {
     await closeCodexSessions();
     if (originalCommand == null) delete process.env.AGENT_BRIDGE_CODEX_COMMAND;

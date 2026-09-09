@@ -43,13 +43,39 @@ type RpcMessage = {
   method?: string;
   params?: Record<string, unknown>;
   result?: unknown;
-  error?: { message?: string };
+  error?: { message?: string; data?: unknown };
 };
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
     : {};
+}
+
+/** Preserve app-server error metadata before crossing the runner boundary. */
+export function codexError(value: unknown): Error {
+  const error = record(value);
+  const data = record(error.data);
+  // Some runtimes put the upstream JSON error envelope in message instead.
+  let envelope: Record<string, unknown> = {};
+  if (typeof error.message === "string" && error.message.length <= 65_536) {
+    try { envelope = record(JSON.parse(error.message)); } catch {}
+  }
+  const upstream = record(envelope.error);
+  const info = error.codexErrorInfo ?? data.codexErrorInfo;
+  const statuses: Record<string, number> = {
+    badRequest: 400, contextWindowExceeded: 400, unauthorized: 401,
+    usageLimitExceeded: 429, serverOverloaded: 503, internalServerError: 500
+  };
+  const detail = Object.values(record(info)).map(record).find((item) => item.httpStatusCode != null);
+  const status = (typeof info === "string" ? statuses[info] : detail?.httpStatusCode)
+    ?? envelope.status ?? (upstream.type === "invalid_request_error" ? 400 : undefined);
+  return Object.assign(new Error(typeof upstream.message === "string" ? upstream.message
+    : typeof error.message === "string" ? error.message : "Codex request failed"),
+    Number.isInteger(status) && Number(status) >= 400 && Number(status) <= 599
+      ? { status: Number(status) } : {},
+    typeof upstream.type === "string" ? { type: upstream.type } : {},
+    typeof upstream.code === "string" ? { code: upstream.code } : {});
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -178,8 +204,14 @@ export function toCodexCompatibleSchema(schema: unknown): unknown {
   return out;
 }
 
+function batchToolName(input: ChatRequest) {
+  let name = "__agent_bridge_batch";
+  while (input.tools.some((tool) => tool.function.name === name)) name += "_";
+  return name;
+}
+
 function codexDynamicTools(input: ChatRequest) {
-  return selectedTools(input).map(({ function: tool }) => {
+  const tools = selectedTools(input).map(({ function: tool }) => {
     let inputSchema: unknown;
     try {
       inputSchema = toCodexCompatibleSchema(tool.parameters ?? { type: "object", properties: {} });
@@ -194,6 +226,20 @@ function codexDynamicTools(input: ChatRequest) {
       inputSchema
     };
   });
+  if (!tools.length) return tools;
+  return [...tools, {
+    type: "function" as const,
+    name: batchToolName(input),
+    description: "Submit multiple independent host function calls together. Use the exact arguments from each named function's schema. Never batch calls that depend on each other's results.",
+    inputSchema: {
+      type: "object", properties: { calls: { type: "array", minItems: 1, items: {
+        type: "object", properties: {
+          name: { type: "string", enum: tools.map((tool) => tool.name) },
+          arguments: { type: "object", additionalProperties: true }
+        }, required: ["name", "arguments"], additionalProperties: false
+      } } }, required: ["calls"], additionalProperties: false
+    }
+  }];
 }
 
 function command() {
@@ -331,7 +377,7 @@ function rpc(child: ChildProcessWithoutNullStreams, onMessage: (message: RpcMess
         const request = pending.get(message.id);
         if (!request) return;
         pending.delete(message.id);
-        if (message.error) request.reject(new Error(message.error.message ?? "Codex request failed"));
+        if (message.error) request.reject(codexError(message.error));
         else request.resolve(message.result);
       } else {
         onMessage(message);
@@ -594,6 +640,53 @@ async function probeCodexInputCapabilities(): Promise<InputCapabilities> {
   }
 }
 
+export async function discoverCodexModels() {
+  const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-models-"));
+  const child = spawn(command(), ["app-server", "--stdio"], {
+    cwd, env: codexEnvironment(cwd), stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32"
+  });
+  const client = rpc(child, () => {});
+  child.stderr.resume();
+  child.once("error", (error) => client.close(error));
+  child.once("close", () => client.close(new Error("Codex model discovery exited")));
+  const timeout = setTimeout(() => client.close(new Error("Codex model discovery timed out")), 10_000);
+  timeout.unref();
+  try {
+    await client.request("initialize", {
+      clientInfo: { name: "agent-bridge", version: "0.1.0" }
+    });
+    client.notify("initialized");
+    const models: Array<{ id: string; name: string; reasoningEfforts: string[]; defaultReasoningEffort?: string }> = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = record(await client.request("model/list", { includeHidden: false, ...(cursor ? { cursor } : {}) }));
+      if (!Array.isArray(page.data)) throw new Error("Codex returned an invalid model catalog");
+      for (const value of page.data) {
+        const model = record(value);
+        if (model.hidden === true || typeof model.model !== "string" || !model.model) continue;
+        const efforts = Array.isArray(model.supportedReasoningEfforts)
+          ? model.supportedReasoningEfforts.map((value) => String(record(value).reasoningEffort)).filter((value) => REASONING.has(value))
+          : [];
+        const defaultEffort = String(model.defaultReasoningEffort ?? "");
+        models.push({ id: model.model, name: typeof model.displayName === "string" ? model.displayName : model.model,
+          reasoningEfforts: efforts,
+          ...(REASONING.has(defaultEffort) ? { defaultReasoningEffort: defaultEffort } : {}) });
+      }
+      cursor = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : undefined;
+      if (cursor && cursors.has(cursor)) throw new Error("Codex repeated a model catalog cursor");
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return models;
+  } finally {
+    clearTimeout(timeout);
+    client.close();
+    await stopCodexProcess(child);
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
+
 export async function detectCodex() {
   const cmd = command();
   let version: string | null = null;
@@ -623,31 +716,7 @@ export async function detectCodex() {
   const inputs = probeCodexInputCapabilities();
 
   try {
-    const { stdout } = await exec(cmd, ["debug", "models", "--bundled"], {
-      timeout: 10_000,
-      maxBuffer: 8 * 1024 * 1024
-    }).catch(async () => {
-      return exec(cmd, ["models"], { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
-    });
-    const payload = JSON.parse(stdout) as { models?: Array<Record<string, unknown>> };
-    const models = (payload.models ?? [])
-      .filter((model) => model.visibility === "list" || !model.visibility)
-      .sort((a, b) => Number(a.priority ?? 999) - Number(b.priority ?? 999))
-      .flatMap((model) => {
-        if (typeof model.slug !== "string") return [];
-        const efforts = Array.isArray(model.supported_reasoning_levels)
-          ? model.supported_reasoning_levels
-              .map((value) => String(record(value).effort ?? value))
-              .filter((value) => REASONING.has(value))
-          : [];
-        const defaultEffort = String(model.default_reasoning_level ?? "");
-        return [{
-          id: model.slug,
-          name: typeof model.display_name === "string" ? model.display_name : model.slug,
-          reasoningEfforts: efforts,
-          ...(REASONING.has(defaultEffort) ? { defaultReasoningEffort: defaultEffort } : {})
-        }];
-      });
+    const models = await discoverCodexModels();
     return {
       id: "codex" as const,
       name: "Codex",
@@ -674,17 +743,7 @@ export async function detectCodex() {
 
 type RunOptions = NonNullable<Parameters<ChatRunner>[1]>;
 
-const pendingCalls = new Map<string, CodexSession>();
 const sessions = new Set<CodexSession>();
-
-function pendingResult(input: ChatRequest) {
-  for (let index = input.messages.length - 1; index >= 0; index--) {
-    const message = input.messages[index];
-    if (message?.role !== "tool") continue;
-    const session = pendingCalls.get(message.tool_call_id);
-    if (session) return session;
-  }
-}
 
 class CodexSession {
   private readonly client: ReturnType<typeof rpc>;
@@ -692,7 +751,7 @@ class CodexSession {
   private content = "";
   private stderr = "";
   private usage?: ChatTurn["usage"];
-  private pending?: { callId: string };
+  private readonly toolCalls: ChatTurn["toolCalls"] = [];
   private waiter?: {
     input: ChatRequest;
     options: RunOptions;
@@ -707,7 +766,10 @@ class CodexSession {
     private readonly cwd: string,
     private readonly child: ChildProcessWithoutNullStreams
   ) {
-    this.client = rpc(child, (message) => this.onMessage(message));
+    this.client = rpc(child, (message) => {
+      try { this.onMessage(message); }
+      catch (error) { void this.close(error instanceof Error ? error : new Error("Codex event failed")); }
+    });
     child.stderr.on("data", (chunk) => { this.stderr += chunk.toString(); });
     child.on("error", (error) => { void this.close(error); });
     child.on("close", (code) => {
@@ -731,6 +793,10 @@ class CodexSession {
         "--disable", "computer_use",
         "--disable", "image_generation",
         "--disable", "multi_agent",
+        // The external host executes functions; code-mode would hide their
+        // batch inside an exec call that waits for those external results.
+        "--disable", "code_mode_host",
+        "-c", 'features.code_mode={enabled=false,direct_only_tool_namespaces=["functions"]}',
         "app-server",
         "--stdio"
       ],
@@ -782,7 +848,10 @@ class CodexSession {
       sandbox: "read-only",
       ephemeral: true,
       dynamicTools,
-      baseInstructions: HOST_TOOL_INSTRUCTIONS
+      experimentalRawEvents: true,
+      baseInstructions: HOST_TOOL_INSTRUCTIONS + (dynamicTools.length
+        ? ` For two or more independent host function calls, use ${batchToolName(input)} with a calls array, including repeated calls to the same function. This also satisfies a required or named host function choice. Use each function's declared argument schema. Calls needing earlier results must stay in separate turns.`
+        : "")
     }));
     const threadId = record(started.thread).id;
     if (typeof threadId !== "string") throw new Error("Codex returned no thread id");
@@ -842,43 +911,61 @@ class CodexSession {
       this.waiter?.options.onDelta?.({ reasoning_content: params.delta });
     } else if (message.method === "thread/tokenUsage/updated") {
       this.usage = tokenUsage(params) ?? this.usage;
-    } else if (message.method === "item/tool/call") {
-      if (this.pending) {
-        void this.close(new Error("Codex emitted overlapping tool calls"));
-        return;
+    } else if (message.method === "rawResponseItem/completed") {
+      const item = record(params.item);
+      if (item.type === "custom_tool_call") {
+        throw new Error(`Codex built-in operation refused: ${String(item.name)}`);
       }
-      const call = {
-        id: String(params.callId ?? crypto.randomUUID()),
-        name: String(params.tool ?? ""),
-        arguments: record(params.arguments)
-      };
-      this.pending = { callId: call.id };
-      pendingCalls.set(call.id, this);
+      if (item.type !== "function_call") return;
+      try {
+        if (typeof item.call_id !== "string" || !item.call_id || !this.waiter ||
+            (item.namespace != null && item.namespace !== "" && item.namespace !== "functions")) {
+          throw new Error(`Codex returned an unknown host tool call: ${String(item.name)}`);
+        }
+        const args: unknown = JSON.parse(String(item.arguments));
+        const batch = item.name === batchToolName(this.waiter.input);
+        const calls = batch ? record(args).calls : [{ name: item.name, arguments: args }];
+        if (!Array.isArray(calls) || !calls.length) throw new Error("Codex returned an empty or invalid tool batch");
+        const tools = selectedTools(this.waiter.input);
+        for (const [index, value] of calls.entries()) {
+          const call = record(value);
+          if (!tools.some(({ function: tool }) => tool.name === call.name)) {
+            throw new Error(`Codex returned an unknown host tool call: ${String(call.name)}`);
+          }
+          if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+            throw new Error("Codex returned non-object tool arguments");
+          }
+          const id = batch ? `${item.call_id}:${index}` : item.call_id;
+          if (this.toolCalls.some((call) => call.id === id)) throw new Error("Codex returned duplicate tool call IDs");
+          this.toolCalls.push({ id, name: String(call.name), arguments: record(call.arguments) });
+        }
+      } catch (error) {
+        void this.close(error instanceof Error ? error : new Error("Invalid Codex tool call"));
+      }
+    } else if (message.method === "rawResponse/completed" && this.toolCalls.length) {
+      // This is the model-response boundary, before Codex waits for dynamic tool
+      // results. item/tool/call may be serialized, so it cannot delimit a batch.
+      this.usage = tokenUsage({ tokenUsage: { last: params.usage } }) ?? this.usage;
       if (this.content) this.waiter?.options.onDelta?.({ content: this.content });
-      this.emitCall(call);
-      this.resolve({
-        content: this.content || null,
-        toolCalls: [call],
-        finishReason: "tool_calls",
-        usage: this.usage
-      });
-      // ponytail: one in-flight dynamic call per Codex turn; batch only if a model emits parallel calls.
-      this.armTimeout("Codex tool result");
+      this.toolCalls.forEach((call, index) => this.emitCall(call, index));
+      this.resolve({ content: this.content || null, toolCalls: this.toolCalls,
+        finishReason: "tool_calls", usage: this.usage });
+      void this.close();
     } else if (message.method === "turn/completed") {
       const turn = record(params.turn);
       if (turn.status !== "completed") {
-        void this.close(new Error(String(record(turn.error).message ?? "Codex turn failed")));
+        void this.close(codexError(turn.error));
         return;
       }
       try {
         const completed = completedCodexTurn(
           this.content,
-          [],
+          this.toolCalls,
           this.usage,
           this.waiter ? selectedTools(this.waiter.input) : []
         );
         if (completed.toolCalls.length) {
-          this.emitCall(completed.toolCalls[0]!);
+          completed.toolCalls.forEach((call, index) => this.emitCall(call, index));
         } else if (completed.content) {
           this.waiter?.options.onDelta?.({ content: completed.content });
         }
@@ -897,10 +984,10 @@ class CodexSession {
     waiter?.resolve(turn);
   }
 
-  private emitCall(call: ChatTurn["toolCalls"][number]) {
+  private emitCall(call: ChatTurn["toolCalls"][number], index = 0) {
     this.waiter?.options.onDelta?.({
       tool_calls: [{
-        index: 0,
+        index,
         id: call.id,
         type: "function",
         function: { name: call.name, arguments: JSON.stringify(call.arguments) }
@@ -936,8 +1023,6 @@ class CodexSession {
     this.clearTimeout();
     const waiter = this.takeWaiter();
     waiter?.reject(error);
-    if (this.pending) pendingCalls.delete(this.pending.callId);
-    this.pending = undefined;
     this.client.close(error);
     this.cleanup = (async () => {
       try {
@@ -959,8 +1044,6 @@ export async function closeCodexSessions() {
 }
 
 export const runCodex: ChatRunner = async (input, options = {}) => {
-  const pending = pendingResult(input);
-  if (pending) await pending.close();
   const session = await CodexSession.create(input, options);
   return session.start(input, options);
 };
@@ -1062,7 +1145,7 @@ export const runCodexImage: ImageRunner = async (input, options = {}) => {
     if (message.method !== "turn/completed") return;
     const turn = record(params.turn);
     if (turn.status !== "completed") {
-      fail(new Error(String(record(turn.error).message ?? "Codex image generation failed")));
+      fail(codexError(turn.error));
       return;
     }
     if (!image || typeof image.result !== "string") {

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import {
   capabilityToken,
   createAgentBridge,
-  listen
+  listen,
+  type LogRecord
 } from "../src/index.js";
 import {
   authSupport,
@@ -106,18 +107,37 @@ if (args[0] === "--version") {
 } else if (args.includes("generate-json-schema")) {
   process.exit(0);
 } else {
+  let httpStatus;
+  let mode;
   createInterface({ input: process.stdin }).on("line", (line) => {
     const message = JSON.parse(line);
     if (message.method === "initialize") send({ id: message.id, result: {} });
-    else if (message.method === "modelProvider/capabilities/read") {
+    else if (message.method === "model/list") {
+      send({ id: message.id, result: { data: [{ model: "gpt-test", displayName: "GPT Test" }], nextCursor: null } });
+    } else if (message.method === "modelProvider/capabilities/read") {
       send({ id: message.id, result: { imageGeneration: false } });
     } else if (message.method === "thread/start") {
+      mode = message.params.model;
+      httpStatus = /^http-(\\d+)$/.exec(message.params.model)?.[1];
       send({ id: message.id, result: { thread: { id: "thread-1" } } });
     } else if (message.method === "turn/start") {
+      if (mode === "rpc-error") {
+        send({ id: message.id, error: { message: "Invalid RPC parameters", data: { codexErrorInfo: "badRequest" } } });
+        return;
+      }
       send({ id: message.id, result: { turn: { id: "turn-1" } } });
+      if (mode === "hang") return;
+      if (mode === "success") {
+        send({ method: "item/agentMessage/delta", params: { delta: "done" } });
+        send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+        return;
+      }
       send({ method: "turn/completed", params: { turn: {
         status: "failed",
-        error: { message: "stream error: unauthorized" }
+        error: httpStatus ? {
+          message: "The selected model is unavailable for this account.",
+          codexErrorInfo: { httpConnectionFailed: { httpStatusCode: Number(httpStatus) } }
+        } : { message: "stream error: unauthorized" }
       } } });
     } else if (message.id != null) send({ id: message.id, result: {} });
   });
@@ -147,10 +167,17 @@ async function harness(
       else process.env.AGENT_BRIDGE_CODEX_COMMAND = original;
     });
   }
+  const records: LogRecord[] = [];
+  const logger = { level: "info" as const, options: {},
+    debug() {}, info(scope: string, message: string, meta?: Record<string, unknown>) { records.push({ timestamp: "", level: "info", scope, message, meta }); },
+    warn(scope: string, message: string, meta?: Record<string, unknown>) { records.push({ timestamp: "", level: "warn", scope, message, meta }); },
+    error(scope: string, message: string, meta?: Record<string, unknown>) { records.push({ timestamp: "", level: "error", scope, message, meta }); },
+    child() { return this; }, async close() {}
+  };
   const bridge = createAgentBridge({
     controlToken,
     preloadModels: false,
-    logger: { level: "silent" },
+    logger,
     // Only Codex is wired to the fake; Grok keeps the production shape of an
     // adapter with no scriptable login.
     reconnect: {
@@ -192,7 +219,7 @@ async function harness(
     };
     return discovery.adapters.find((adapter) => adapter.id === id)?.authState;
   };
-  return { bridge, fake, call, turn, authStateOf, baseUrl, controlToken };
+  return { bridge, fake, call, turn, authStateOf, baseUrl, controlToken, records };
 }
 
 async function settled(
@@ -571,4 +598,44 @@ test("a request the bridge itself rejected is not evidence about credentials", a
   // A malformed body must not re-probe, must not spawn a CLI, and must not
   // claim the credential died.
   expect(await authStateOf("codex")).toBe("ready");
+}, 20_000);
+
+test("preserves upstream statuses and records terminal outcomes across JSON and SSE", async () => {
+  const { fake, turn, records } = await harness({ codexRuntime: true });
+  await fake.signIn();
+  for (const path of ["/v1/chat/completions", "/v1/responses"]) {
+    for (const status of [400, 404, 422, 429, 503]) {
+      for (const stream of [false, true]) {
+        records.length = 0;
+        const response = await turn({ model: `http-${status}`, stream,
+          ...(path.endsWith("responses") ? { input: "hello" } : { messages: [{ role: "user", content: "hello" }] }) }, path);
+        const body = await response.text();
+        expect(response.status).toBe(stream ? 200 : status);
+        expect(body).toContain("The selected model is unavailable for this account.");
+        const category = status === 429 ? "rate_limited" : status === 404 ? "not_found" : status >= 500 ? "server_error" : "invalid_request";
+        expect(body).toContain(`"category":"${category}"`);
+        if (stream && path.endsWith("responses")) expect(body).toContain("response.failed");
+        await new Promise((resolve) => setImmediate(resolve));
+        const logs = records.filter((record) => record.scope === "http");
+        expect(logs).toHaveLength(1);
+        expect(logs[0]).toMatchObject({ level: status >= 500 ? "error" : "warn", meta: {
+          status: stream ? 200 : status, outcome: "failed", errorStatus: status,
+          category, model: `http-${status}`, adapter: "codex", stream
+        } });
+        expect(Number(logs[0]!.meta!.durationMs)).toBeGreaterThan(0);
+      }
+    }
+  }
+  const rpc = await turn({ model: "rpc-error", input: "hello" }, "/v1/responses");
+  expect(rpc.status).toBe(400);
+  expect(await rpc.json()).toMatchObject({ error: { type: "invalid_request_error", message: "Invalid RPC parameters" } });
+}, 30_000);
+
+test("records successful streaming completion once", async () => {
+  const { fake, turn, records } = await harness({ codexRuntime: true });
+  await fake.signIn();
+  const done = await turn({ model: "success", input: "hello", stream: true }, "/v1/responses");
+  expect(await done.text()).toContain("response.completed");
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(records.filter((record) => record.scope === "http")).toMatchObject([{ meta: { status: 200, outcome: "completed" } }]);
 }, 20_000);
