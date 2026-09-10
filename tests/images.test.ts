@@ -208,7 +208,9 @@ test("returns a Responses image_generation_call and validates image controls", a
     { tool_choice: "required", store: true },
     { tool_choice: "required", max_output_tokens: 100 },
     { tool_choice: "required", instructions: "override the user" },
-    { tool_choice: "none" }
+    { tool_choice: "none" },
+    { temperature: 0 },
+    { top_p: 0 }
   ]) {
     await expect(respondResponses(
       responsesRequestSchema.parse({

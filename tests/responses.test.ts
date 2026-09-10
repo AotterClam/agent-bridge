@@ -303,6 +303,8 @@ test("streams semantic events across reasoning, text, and tool calls", async () 
   const parsed = await events(
     await respondResponses(request({
       stream: true,
+      temperature: 0.3,
+      top_p: 0.8,
       include: ["reasoning.encrypted_content"]
     }), runner)
   );
@@ -332,6 +334,9 @@ test("streams semantic events across reasoning, text, and tool calls", async () 
   expect(parsed.map((event) => event.sequence_number)).toEqual(
     parsed.map((_event, index) => index)
   );
+  for (const event of parsed.filter((event) => event.response)) {
+    expect(event.response).toMatchObject({ temperature: null, top_p: null });
+  }
   const completed = parsed.at(-1)!;
   expect(completed.response.status).toBe("completed");
   expect(completed.response.output.map((item: any) => item.type)).toEqual([
@@ -356,6 +361,9 @@ test("re-emits content and calls the adapter resolved without streaming", async 
   const types = parsed.map((event) => event.type);
   expect(types).toContain("response.output_text.delta");
   expect(types).toContain("response.function_call_arguments.done");
+  for (const event of parsed.filter((event) => event.response)) {
+    expect(event.response).toMatchObject({ temperature: null, top_p: null });
+  }
   const completed = parsed.at(-1)!;
   expect(completed.response.output.map((item: any) => item.type)).toEqual([
     "message",
