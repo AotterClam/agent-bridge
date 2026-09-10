@@ -173,6 +173,14 @@ neither a native output-token cap nor replayable encrypted reasoning state, so
 the bridge applies the token budget through their shared system transcript and
 returns reasoning summaries without fabricating encrypted content.
 
+Both chat completions and text Responses accept optional `temperature` (0–2)
+and `top_p` (0–1), including `null`, for OpenAI client compatibility. The
+coding-agent runtimes control sampling and expose no native overrides: these
+values are validated but ignored by the coding-agent backends, not forwarded
+as sampling controls or determinism guarantees.
+Responses report both fields as `null` because the effective settings are
+unknown. Invalid types or values still return `400`.
+
 ### Client SDK connection
 
 Connect to a standalone bridge using the client SDK:

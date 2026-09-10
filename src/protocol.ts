@@ -48,9 +48,17 @@ const toolChoice = z.union([
   })
 ]);
 
+// Coding-agent runtimes own sampling. Accept validated OpenAI hints for client
+// compatibility; these are not native sampler overrides.
+export const samplingFields = {
+  temperature: z.number().min(0).max(2).nullish(),
+  top_p: z.number().min(0).max(1).nullish()
+};
+
 export const chatRequestSchema = z
   .object({
     model: z.string().min(1),
+    ...samplingFields,
     messages: z
       .array(
         z.discriminatedUnion("role", [

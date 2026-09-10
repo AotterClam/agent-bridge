@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   chatRequestSchema,
+  samplingFields,
   errorPayload,
   startSseHeartbeat,
   type ChatDelta,
@@ -64,8 +65,7 @@ export const responsesRequestSchema = z
     store: z.boolean().nullish(),
     previous_response_id: z.string().nullish(),
     max_output_tokens: z.number().int().positive().nullish(),
-    temperature: z.number().nullish(),
-    top_p: z.number().nullish(),
+    ...samplingFields,
     top_logprobs: z.number().nullish(),
     max_tool_calls: z.number().nullish(),
     parallel_tool_calls: z.boolean().nullish(),
@@ -160,8 +160,6 @@ function messageContent(
  */
 function unsupportedControl(input: ResponsesRequest) {
   if (input.store) return "store: true";
-  if (input.temperature != null) return "temperature";
-  if (input.top_p != null) return "top_p";
   if (input.top_logprobs) return "top_logprobs";
   if (input.max_tool_calls != null) return "max_tool_calls";
   if (input.parallel_tool_calls === false) return "parallel_tool_calls: false";
@@ -283,6 +281,8 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
   }
   const chat = chatRequestSchema.safeParse({
     model: input.model,
+    temperature: input.temperature,
+    top_p: input.top_p,
     messages,
     tools,
     tool_choice:
@@ -345,8 +345,9 @@ function responsePayload(
       summary: null
     },
     store: false,
-    temperature: 1,
-    top_p: 1,
+    // The runtime does not report its effective sampling settings.
+    temperature: null,
+    top_p: null,
     presence_penalty: 0,
     frequency_penalty: 0,
     top_logprobs: 0,
@@ -398,6 +399,9 @@ export async function respondResponses(
     }
     if (input.max_output_tokens != null) {
       badRequest("max_output_tokens is not supported for image_generation.");
+    }
+    if (input.temperature != null || input.top_p != null) {
+      badRequest("Sampling hints are only supported for text responses.");
     }
     const control = unsupportedControl(input);
     if (control) badRequest(`This bridge does not support ${control}.`);
