@@ -1,5 +1,5 @@
 import { expect, jest, test } from "bun:test";
-import { SSE_HEARTBEAT_MS, type ChatRunner, type ChatTurn } from "../src/protocol.js";
+import { SSE_HEARTBEAT_MS, chatRequestSchema, type ChatRunner, type ChatTurn } from "../src/protocol.js";
 import {
   respondResponses,
   responsesRequestSchema,
@@ -85,8 +85,6 @@ test("replays function_call items as one assistant message per burst", () => {
 
 test("rejects controls the adapters cannot honor", () => {
   for (const overrides of [
-    { temperature: 0.2 },
-    { top_p: 0.5 },
     { max_tool_calls: 2 },
     { parallel_tool_calls: false },
     { background: true },
@@ -238,8 +236,8 @@ test("returns a completed response with message and function_call items", async 
   expect(typeof payload.completed_at).toBe("number");
   expect(payload).toMatchObject({
     parallel_tool_calls: true,
-    temperature: 1,
-    top_p: 1,
+    temperature: null,
+    top_p: null,
     presence_penalty: 0,
     frequency_penalty: 0,
     top_logprobs: 0,
@@ -376,4 +374,23 @@ test("reports runner failure as response.failed", async () => {
   expect(failed.type).toBe("response.failed");
   expect(failed.response.status).toBe("failed");
   expect(failed.response.error.message).toBe("boom");
+});
+
+
+test("accepts validated sampling hints consistently without claiming native control", async () => {
+  for (const sampling of [{ temperature: 0.3, top_p: 0.8 }, { temperature: 0, top_p: 0 }, { temperature: 2, top_p: 1 }, { temperature: null, top_p: null }]) {
+    const input = request(sampling);
+    const chat = toChatRequest(input);
+    expect(chat).toMatchObject(sampling);
+    expect(chatRequestSchema.parse({ model: "test-model", messages: [{ role: "user", content: "hello" }], ...sampling })).toMatchObject(sampling);
+    const result = await respondResponses(input, async (received) => {
+      expect(received).toMatchObject(sampling);
+      return { content: "ok", toolCalls: [], finishReason: "stop" };
+    });
+    expect(await result.json()).toMatchObject({ temperature: null, top_p: null });
+  }
+  for (const sampling of [{ temperature: -0.1 }, { temperature: 2.1 }, { temperature: "0.3" }, { top_p: -0.1 }, { top_p: 1.1 }, { top_p: "0.8" }]) {
+    expect(responsesRequestSchema.safeParse({ model: "test-model", input: "hello", ...sampling }).success).toBe(false);
+    expect(chatRequestSchema.safeParse({ model: "test-model", messages: [{ role: "user", content: "hello" }], ...sampling }).success).toBe(false);
+  }
 });
