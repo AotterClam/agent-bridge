@@ -13,7 +13,7 @@ async function withCodex(script: string, check: (directory: string) => Promise<v
   const previous = process.env.AGENT_BRIDGE_CODEX_COMMAND;
   await writeFile(command, `#!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const transcript = ${JSON.stringify(join(directory, "requests"))};
 createInterface({ input: process.stdin }).on("line", (line) => {
@@ -58,6 +58,50 @@ if (request.method === "thread/start") {
 }`;
 const input = chatRequestSchema.parse({ model: "test", messages: [{ role: "user", content: "Look up both" }],
   tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: { id: { type: "string" } } } } }] });
+
+test("pins cached model metadata to direct host tools without changing the native cache", async () => {
+  const previous = process.env.CODEX_HOME;
+  try {
+    await withCodex(`
+      if (request.method === "thread/start") {
+        const option = process.argv.find(arg => arg.startsWith("model_catalog_json="));
+        const catalog = JSON.parse(readFileSync(JSON.parse(option.split("=").slice(1).join("=")), "utf8"));
+        if (catalog.models.length !== 1 || catalog.models[0].slug !== "test" ||
+            catalog.models[0].tool_mode !== "direct" || catalog.models[0].shell_type !== "disabled" ||
+            catalog.models[0].context_window !== 123456) process.exit(7);
+        send({ id: request.id, result: { thread: { id: "test" } } });
+      } else if (request.method === "turn/start") {
+        send({ id: request.id, result: {} });
+        send({ method: "item/agentMessage/delta", params: { delta: "direct tools" } });
+        send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+      }
+    `, async (directory) => {
+      process.env.CODEX_HOME = directory;
+      const cache = JSON.stringify({ identity: "do not copy", models: [
+        { slug: "test", tool_mode: "code_mode_only", shell_type: "unified_exec", context_window: 123456 },
+        { slug: "other", tool_mode: "code_mode_only" }
+      ] });
+      await writeFile(join(directory, "models_cache.json"), cache);
+      expect((await runCodex(input)).content).toBe("direct tools");
+      expect(await readFile(join(directory, "models_cache.json"), "utf8")).toBe(cache);
+    });
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+  }
+});
+
+test("still refuses an unexpected built-in exec instead of executing or replaying it", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "custom_tool_call", name: "exec", input: "never run" } } });
+    }
+  `, async () => {
+    await expect(runCodex(input)).rejects.toThrow("Codex built-in operation refused: exec");
+  });
+});
 
 test("returns a complete tool batch before Codex waits for results and replays by call ID", async () => {
   await withCodex(batchScript, async (directory) => {

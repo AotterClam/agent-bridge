@@ -482,6 +482,11 @@ the runtime waits for tool results. An internal batch function also lets models
 submit several independent host calls through a single native call. The bridge
 expands it into ordinary `tool_calls` with distinct IDs; it does not execute the
 host functions. Host tools are exposed directly instead of through code-mode.
+When the native model cache supplies metadata, each chat session uses Codex's
+`model_catalog_json` override to preserve that model's metadata while selecting
+direct tools and disabling shell tools. The native cache is never modified;
+the session-local catalog is removed on close. Without cached metadata, the
+existing feature flags apply. Unexpected built-in operations still fail closed.
 The host executes the tools and sends every result with its original call ID
 in the next stateless request; the bridge
 replays that transcript with the current tool list in a fresh session.
