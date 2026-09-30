@@ -794,7 +794,7 @@ class CodexSession {
         const model = Array.isArray(models) ? models.find((model) => record(model).slug === input.model) : undefined;
         if (model) {
           catalog = join(cwd, "host-model.json");
-          await writeFile(catalog, JSON.stringify({ models: [{ ...model, tool_mode: "direct", shell_type: "disabled" }] }), { mode: 0o600 });
+          await writeFile(catalog, JSON.stringify({ models: [{ ...model, tool_mode: "direct", shell_type: "disabled", experimental_supported_tools: [] }] }), { mode: 0o600 });
         }
       }
     } catch (error) {

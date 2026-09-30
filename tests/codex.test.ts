@@ -68,7 +68,8 @@ test("pins cached model metadata to direct host tools without changing the nativ
         const catalog = JSON.parse(readFileSync(JSON.parse(option.split("=").slice(1).join("=")), "utf8"));
         if (catalog.models.length !== 1 || catalog.models[0].slug !== "test" ||
             catalog.models[0].tool_mode !== "direct" || catalog.models[0].shell_type !== "disabled" ||
-            catalog.models[0].context_window !== 123456) process.exit(7);
+            catalog.models[0].context_window !== 123456 ||
+            catalog.models[0].experimental_supported_tools.length !== 0) process.exit(7);
         send({ id: request.id, result: { thread: { id: "test" } } });
       } else if (request.method === "turn/start") {
         send({ id: request.id, result: {} });
@@ -78,7 +79,7 @@ test("pins cached model metadata to direct host tools without changing the nativ
     `, async (directory) => {
       process.env.CODEX_HOME = directory;
       const cache = JSON.stringify({ identity: "do not copy", models: [
-        { slug: "test", tool_mode: "code_mode_only", shell_type: "unified_exec", context_window: 123456 },
+        { slug: "test", tool_mode: "code_mode_only", shell_type: "unified_exec", context_window: 123456, experimental_supported_tools: ["clock"] },
         { slug: "other", tool_mode: "code_mode_only" }
       ] });
       await writeFile(join(directory, "models_cache.json"), cache);
