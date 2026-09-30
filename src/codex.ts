@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -783,6 +783,24 @@ class CodexSession {
     if (options.signal?.aborted) throw codexHandshakeError("aborted");
     const timeoutMs = codexHandshakeTimeoutMs();
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
+    // Model metadata can select code_mode_only even when its feature is disabled.
+    // Use Codex's native catalog override for this session; keep its cache untouched.
+    let catalog: string | undefined;
+    try {
+      const cache = await readFile(join(codexEnvironment(cwd).CODEX_HOME, "models_cache.json"), "utf8")
+        .catch((error) => { if (record(error).code === "ENOENT") return undefined; throw error; });
+      if (cache) {
+        const models = record(JSON.parse(cache)).models;
+        const model = Array.isArray(models) ? models.find((model) => record(model).slug === input.model) : undefined;
+        if (model) {
+          catalog = join(cwd, "host-model.json");
+          await writeFile(catalog, JSON.stringify({ models: [{ ...model, tool_mode: "direct", shell_type: "disabled" }] }), { mode: 0o600 });
+        }
+      }
+    } catch (error) {
+      await rm(cwd, { recursive: true, force: true });
+      throw error;
+    }
     const child = spawn(
       command(),
       [
@@ -797,6 +815,7 @@ class CodexSession {
         // batch inside an exec call that waits for those external results.
         "--disable", "code_mode_host",
         "-c", 'features.code_mode={enabled=false,direct_only_tool_namespaces=["functions"]}',
+        ...(catalog ? ["-c", `model_catalog_json=${JSON.stringify(catalog)}`] : []),
         "app-server",
         "--stdio"
       ],
