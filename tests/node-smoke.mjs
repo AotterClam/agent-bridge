@@ -40,6 +40,7 @@ createInterface({ input: process.stdin }).on("line", line => {
   if (m.method === "thread/inject_items") globalThis.native = true;
   console.log(JSON.stringify({ id: m.id, result }));
   if (m.method === "turn/start" && globalThis.native) {
+    console.log(JSON.stringify({ method: "turn/started", params: { turn: { id: "native-turn" } } }));
     console.log(JSON.stringify({ method: "rawResponseItem/completed", params: { item: { type: "tool_search_call", id: "native-search", call_id: "search-call", execution: "client", arguments: { query: "shipping" }, status: "completed" } } }));
     console.log(JSON.stringify({ method: "rawResponse/completed", params: { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } }));
   }

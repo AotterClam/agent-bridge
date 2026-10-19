@@ -6,7 +6,7 @@ import type { ResponsesRequest } from "./responses.js";
 export type NativeItem = Record<string, unknown>;
 export type NativeTurn = { output: NativeItem[]; usage?: ChatTurn["usage"] };
 export type NativeRunner = (input: ResponsesRequest, options?: {
-  signal?: AbortSignal; onItem?: (item: NativeItem) => void;
+  signal?: AbortSignal; onItem?: (item: NativeItem) => void; plan?: NativePlan;
 }) => Promise<NativeTurn>;
 const name = z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/);
 const object = z.record(z.string(), z.unknown());
@@ -30,6 +30,7 @@ export function usesNativeResponses(input: ResponsesRequest) {
   return Boolean(input.tools?.some(t => t.type === "tool_search" || t.type === "namespace" || t.defer_loading != null) ||
     (Array.isArray(input.input) && input.input.some(i => i.namespace != null || ["tool_search_call", "tool_search_output", "additional_tools"].includes(i.type ?? ""))));
 }
+export type NativePlan = ReturnType<typeof nativePlan>;
 export function nativePlan(input: ResponsesRequest) {
   if (input.previous_response_id) nativeError("Native Responses is stateless; send full input history.");
   if (input.tool_choice != null && input.tool_choice !== "auto" && input.tool_choice !== "none") {
@@ -81,7 +82,14 @@ export function nativePlan(input: ResponsesRequest) {
       if (item.type === "tool_search_call") {
         if (!["client", "server"].includes(String(item.execution))) nativeError("Invalid search execution.");
         parse(object, item.arguments);
-      } else if (typeof item.name !== "string" || typeof item.arguments !== "string") nativeError("Invalid native function_call.");
+      } else {
+        if (typeof item.name !== "string" || typeof item.arguments !== "string") nativeError("Invalid native function_call.");
+        const ns = item.namespace === "functions" || item.namespace === "" ? undefined : item.namespace;
+        if ((ns != null && typeof ns !== "string") || !registry.has(`${ns ?? ""}/${item.name}`)) nativeError("History contains an undeclared native function.");
+        let args: unknown;
+        try { args = JSON.parse(item.arguments); } catch { nativeError("History function arguments must be valid JSON."); }
+        if (!args || typeof args !== "object" || Array.isArray(args)) nativeError("History function arguments must be an object.");
+      }
     } else if (item.type === "tool_search_output" || item.type === "function_call_output") {
       const expected = item.type === "tool_search_output" ? "tool_search_call" : "function_call";
       const hosted = item.type === "tool_search_output" && item.execution === "server" && item.call_id == null;

@@ -379,6 +379,11 @@ Chat completions support standard JSON and SSE streaming responses, OpenAI funct
 
 `/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. No response or item history is stored, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
+Codex usage covers every upstream response in the bridge turn, including internal
+native discovery, in both chat and Responses lanes. Exact completion reports are
+summed and take precedence over thread totals. If a completion omits usage, the
+cumulative thread total is the fallback; `last` is used only when neither exists.
+
 ### Native Responses discovery (Codex)
 
 Requests using `tool_search`, `namespace`, `defer_loading`, `additional_tools`,
@@ -410,8 +415,13 @@ Responses, and image lanes keep their existing behavior.
 Regression: `bun test tests/codex.test.ts tests/responses.test.ts`.
 Opt-in real-model smoke (uses the signed-in account, synthetic data only):
 `AGENT_BRIDGE_CODEX_SMOKE_MODEL=<model-id> bun tests/codex-native-smoke.mjs`.
-The native runner isolates `CODEX_HOME`, linking only the sign-in/model cache;
-it does not load profile configuration, personal MCPs or skills, and disables
+The native runner isolates `CODEX_HOME`, linking only the sign-in/model cache.
+Codex 0.163.0's [file credential store](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/login/src/auth/storage.rs)
+saves with truncate/write, so refreshes follow the auth symlink into the original
+file and survive session cleanup. No stale credential copy is written back.
+Recheck this persistence behavior before upgrading to a different storage backend
+or CLI save implementation.
+The native runner does not load profile configuration, personal MCPs or skills, and disables
 built-in web search. Custom profile model providers are outside this native lane.
 The ordinary chat lane keeps its existing configuration behavior.
 

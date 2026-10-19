@@ -779,21 +779,21 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     const isImages = isImageGeneration || isImageEdit;
     const runtime =
       adapter === "claude"
-        ? { run: runClaude, ownedBy: "claude-code", imageCandidate: undefined }
+        ? { run: runClaude, ownedBy: "claude-code", imageCandidate: undefined, native: undefined }
         : adapter === "grok"
-          ? { run: runGrok, ownedBy: "grok", imageCandidate: runGrokImage }
+          ? { run: runGrok, ownedBy: "grok", imageCandidate: runGrokImage, native: undefined }
           : adapter === "antigravity"
-            ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined }
-            : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage };
+            ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined, native: undefined }
+            : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage, native: runCodexResponses };
     const recordFailure = (error: unknown) => {
       logInfo.outcome = "failed";
       logInfo.errorStatus = errorStatus(error);
       logInfo.category = errorCategory(error);
       logInfo.error = error instanceof Error ? error.message : "Bridge failed";
     };
-    const runTurn: ChatRunner = async (input, runOptions) => {
+    const loggedRunner = <Input, Options, Output>(run: (input: Input, options?: Options) => Promise<Output>) => async (input: Input, runOptions?: Options) => {
       try {
-        const turn = await guardedRunner(adapter, runtime.run)(input, runOptions);
+        const turn = await guardedRunner(adapter, run)(input, runOptions);
         logInfo.outcome = "completed";
         return turn;
       } catch (error) {
@@ -801,6 +801,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         throw error;
       }
     };
+
+    const runTurn = loggedRunner(runtime.run);
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -955,13 +957,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
             runTurn,
             controller.signal,
             image,
-            adapter === "codex" ? async (input, options) => {
-              try {
-                const turn = await guardedRunner(adapter, runCodexResponses)(input, options);
-                logInfo.outcome = "completed";
-                return turn;
-              } catch (error) { recordFailure(error); throw error; }
-            } : undefined
+            runtime.native ? loggedRunner(runtime.native) : undefined
           ),
           response
         );

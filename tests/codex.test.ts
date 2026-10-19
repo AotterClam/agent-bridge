@@ -1,6 +1,7 @@
+import * as nativeResponses from "../src/native-responses.js";
 import { nativePlan } from "../src/native-responses.js";
-import { expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { expect, spyOn, test } from "bun:test";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeCodexSessions, codexError, discoverCodexModels, runCodex, runCodexResponses } from "../src/codex.js";
@@ -8,18 +9,19 @@ import { chatRequestSchema, errorPayload, errorStatus, respond, type ChatDelta }
 import { respondResponses, responsesRequestSchema, toChatRequest } from "../src/responses.js";
 
 // Uses real stdio/process cleanup, but never a real account or model request.
-async function withCodex(script: string, check: (directory: string) => Promise<void>) {
+async function withCodex(script: string, check: (directory: string) => Promise<void>, autoTurnStarted = true) {
   const directory = await mkdtemp(join(tmpdir(), "codex-regression-"));
   const command = join(directory, "codex.mjs");
   const previous = process.env.AGENT_BRIDGE_CODEX_COMMAND;
   await writeFile(command, `#!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const transcript = ${JSON.stringify(join(directory, "requests"))};
 createInterface({ input: process.stdin }).on("line", (line) => {
   appendFileSync(transcript, line + "\\n");
   const request = JSON.parse(line);
+  if (${autoTurnStarted} && request.method === "turn/start") send({ method: "turn/started", params: { turn: { id: "active" } } });
   if (request.method === "initialize") send({ id: request.id, result: {} });
   else { ${script} }
 });
@@ -366,7 +368,7 @@ test("does not advertise a successful hosted search when Codex returns an unexec
     const text = await response.text();
     expect(text).toContain('response.failed');
     expect(text).not.toContain('response.completed');
-    expect(text).not.toContain('response.output_item.done');
+    expect(text).toContain('response.output_item.done');
   });
 });
 
@@ -400,7 +402,7 @@ test("native discovery still refuses undeclared host functions and built-in oper
       send({ method: "rawResponseItem/completed", params: { item: ${JSON.stringify(item)} } });
     }
   `, async () => {
-    await expect(runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [shipping] }))).rejects.toHaveProperty("status", 400);
+    await expect(runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [shipping] }))).rejects.toHaveProperty("status", 502);
   });
 });
 
@@ -491,17 +493,20 @@ test("native host-tool sessions do not inherit personal MCP configuration or ski
       }
       if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
       if (request.method === "turn/start") {
+        writeFileSync(process.env.CODEX_HOME + "/auth.json", "rotated-synthetic-sign-in", { mode: 0o600 });
         send({ id: request.id, result: {} });
         send({ method: "rawResponseItem/completed", params: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "isolated" }] } } });
         send({ method: "turn/completed", params: { turn: { status: "completed" } } });
       }
     `, async directory => {
       process.env.CODEX_HOME = directory;
-      await writeFile(join(directory, "auth.json"), "synthetic-sign-in");
+      await writeFile(join(directory, "auth.json"), "synthetic-sign-in", { mode: 0o600 });
       await writeFile(join(directory, "config.toml"), '[mcp_servers.personal]\nurl = "https://personal.invalid"\n');
       const turn = await runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] }));
       expect(turn.output).toMatchObject([{ content: [{ text: "isolated" }] }]);
       expect(await readFile(join(directory, "config.toml"), "utf8")).toContain("personal.invalid");
+      expect(await readFile(join(directory, "auth.json"), "utf8")).toBe("rotated-synthetic-sign-in");
+      expect((await stat(join(directory, "auth.json"))).mode & 0o777).toBe(0o600);
     });
   } finally { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; }
 });
@@ -524,5 +529,166 @@ test("native replay filters history by turn ID and rejects reusing an old host c
       { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "eta-call", arguments: '{}' },
       { type: "function_call_output", call_id: "eta-call", output: 'old result' }
     ] }))).rejects.toThrow("stale or duplicate");
+  });
+});
+
+test("native items ignore late injection echoes until turn/started", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "OLD_MESSAGE" }] } } });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "old-call", arguments: '{}' } } });
+      send({ method: "turn/started", params: { turn: { id: "active" } } });
+      send({ method: "rawResponseItem/completed", params: { turnId: "active", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "NEW_MESSAGE" }] } } });
+      send({ method: "turn/completed", params: { turn: { id: "active", status: "completed" } } });
+    }
+  `, async () => {
+    const items: unknown[] = [];
+    const request = responsesRequestSchema.parse({ model: "test", tools: [shipping], input: [
+      { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "old-call", arguments: '{}' },
+      { type: "function_call_output", call_id: "old-call", output: 'old result' }
+    ] });
+    const turn = await runCodexResponses(request, { onItem: item => items.push(item) });
+    expect(turn.output).toHaveLength(1);
+    expect(JSON.stringify(turn.output)).toContain("NEW_MESSAGE");
+    expect(JSON.stringify(turn.output)).not.toContain("OLD_MESSAGE");
+    expect(items).toEqual(turn.output);
+  }, false);
+});
+
+test("native SSE delivers completed items before turn completion", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "EARLY_ITEM" }] } } });
+      const timer = setInterval(() => {
+        try { readFileSync(transcript + ".continue"); } catch { return; }
+        clearInterval(timer);
+        send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+      }, 10);
+    }
+  `, async directory => {
+    const request = responsesRequestSchema.parse({ model: "test", tools: [nativeSearch], input: "Delivery", stream: true });
+    const response = await respondResponses(request, runCodex, undefined, undefined, runCodexResponses);
+    const reader = response.body!.getReader();
+    let body = "";
+    const decoder = new TextDecoder();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          while (!body.includes("response.output_text.delta")) {
+            const chunk = await reader.read();
+            if (chunk.done) throw new Error("Stream ended before item");
+            body += decoder.decode(chunk.value);
+          }
+        })(),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Native item was buffered until turn completion")), 2500); })
+      ]);
+      expect(body).toContain("EARLY_ITEM");
+      expect(body).not.toContain("response.completed");
+      await writeFile(join(directory, "requests.continue"), "continue");
+      for (;;) { const chunk = await reader.read(); if (chunk.done) break; body += decoder.decode(chunk.value); }
+      expect(body).toContain("response.completed");
+      expect((body.match(/response.output_text.delta/g) ?? [])).toHaveLength(2); // event name and JSON type
+    } finally { clearTimeout(timeout); await reader.cancel(); }
+  });
+});
+
+const malformedNativeItems = [
+    { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "x", arguments: '{PRIVATE_ARGUMENT' },
+    { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "x", arguments: '[]' },
+    { type: "function_call", namespace: "tool_search", name: "tool_search_tool", call_id: "x", arguments: '{PRIVATE_ARGUMENT' },
+    { type: "function_call", namespace: "other", name: "get_eta", call_id: "x", arguments: '{}' },
+    { type: "tool_search_call", call_id: "x", execution: "server", arguments: {} },
+    { type: "tool_search_output", call_id: "x", execution: "server", tools: [{ type: "web_search" }] },
+    { type: "unexpected_model_item" }
+  ];
+test.each(malformedNativeItems)("native model protocol error %#: 502 without leaking raw JSON", async item => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: ${JSON.stringify(item)} } });
+    }
+  `, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch, shipping] });
+    let failure: unknown;
+    try { await runCodexResponses(request); } catch (error) { failure = error; }
+    expect(errorStatus(failure)).toBe(502);
+    expect(errorPayload(failure).category).toBe("upstream_error");
+    expect(errorPayload(failure).message).not.toContain("PRIVATE_ARGUMENT");
+  });
+});
+
+test("native history only calls declared or previously discovered function identities", () => {
+  const call = { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "eta", arguments: '{}' };
+  const result = { type: "function_call_output", call_id: "eta", output: 'date' };
+  const loaded = { type: "additional_tools", role: "developer", tools: [shipping] };
+  const request = responsesRequestSchema.parse({ model: "test", tools: [nativeSearch], input: [call, result] });
+  expect(() => nativePlan(request)).toThrow("undeclared native function");
+  expect(() => nativePlan({ ...request, input: [call, result, loaded] })).toThrow("undeclared native function");
+  expect(nativePlan({ ...request, input: [loaded, call, result] }).registry.size).toBe(1);
+  expect(() => nativePlan({ ...request, input: [loaded, { ...call, namespace: "foreign" }, result] })).toThrow("undeclared native function");
+  expect(() => nativePlan({ ...request, input: [loaded, { ...call, arguments: '{PRIVATE_ARGUMENT' }, result] })).toThrow("valid JSON");
+});
+
+test("exact raw usage wins over thread totals in either event order for ordinary chat", async () => {
+  for (const totalFirst of [true, false]) await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      const total = () => send({ method: "thread/tokenUsage/updated", params: { tokenUsage: { total: { inputTokens: 900, outputTokens: 99, totalTokens: 999 }, last: { inputTokens: 500, outputTokens: 50, totalTokens: 550 } } } });
+      if (${totalFirst}) total();
+      send({ method: "rawResponse/completed", params: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } });
+      if (!${totalFirst}) total();
+      send({ method: "item/agentMessage/delta", params: { delta: "done" } });
+      send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    }
+  `, async () => {
+    expect((await runCodex(input)).usage).toMatchObject({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+  });
+});
+
+test("native request validation runs once through Responses and once for direct callers", async () => {
+  await withCodex(nativeFixture, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
+    const parsed = spyOn(nativeResponses, "nativePlan");
+    try {
+      await respondResponses(request, runCodex, undefined, undefined, runCodexResponses);
+      expect(parsed).toHaveBeenCalledTimes(1);
+      await runCodexResponses(request);
+      expect(parsed).toHaveBeenCalledTimes(2);
+    } finally { parsed.mockRestore(); }
+  });
+});
+
+test("native protocol failures retain upstream classification inside SSE", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "function_call", name: "unknown", call_id: "x", arguments: '{}' } } });
+    }
+  `, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", tools: [nativeSearch], input: "Delivery", stream: true });
+    const response = await respondResponses(request, runCodex, undefined, undefined, runCodexResponses);
+    const body = await response.text();
+    expect(body).toContain('"category":"upstream_error"');
+    expect(body).toContain("response.failed");
+    expect(body).not.toContain("response.completed");
+  });
+});
+
+test("native item consumer errors reject and clean up the owned session", async () => {
+  await withCodex(nativeFixture, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
+    await expect(runCodexResponses(request, { onItem() { throw new Error("consumer failed"); } })).rejects.toThrow("consumer failed");
   });
 });

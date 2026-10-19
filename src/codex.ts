@@ -1,4 +1,4 @@
-import { nativePlan, nativeError, validateNativeTools, type NativeItem, type NativeRunner, type NativeTurn } from "./native-responses.js";
+import { nativePlan, validateNativeTools, type NativePlan, type NativeItem, type NativeRunner, type NativeTurn } from "./native-responses.js";
 import type { ResponsesRequest } from "./responses.js";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -78,6 +78,17 @@ export function codexError(value: unknown): Error {
       ? { status: Number(status) } : {},
     typeof upstream.type === "string" ? { type: upstream.type } : {},
     typeof upstream.code === "string" ? { code: upstream.code } : {});
+}
+
+function nativeUpstreamError(message: string): never {
+  throw Object.assign(new Error(message), { status: 502, category: "upstream_error" });
+}
+function nativeArguments(value: unknown): Record<string, unknown> {
+  let parsed: unknown;
+  try { parsed = typeof value === "string" ? JSON.parse(value) : undefined; }
+  catch { nativeUpstreamError("Codex returned malformed JSON tool arguments."); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) nativeUpstreamError("Codex returned non-object tool arguments.");
+  return parsed as Record<string, unknown>;
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -750,12 +761,15 @@ const sessions = new Set<CodexSession>();
 class CodexSession {
   private readonly client: ReturnType<typeof rpc>;
   private threadId?: string;
-  private native?: { request: ResponsesRequest; plan: ReturnType<typeof nativePlan>; output: NativeItem[]; active: boolean; turnId?: string };
+  private native?: { request: ResponsesRequest; plan: NativePlan; output: NativeItem[]; onItem?: (item: NativeItem) => void; turnId?: string };
 
   private content = "";
   private stderr = "";
   private usage?: ChatTurn["usage"];
   private rawUsage?: ChatTurn["usage"];
+  private rawUsageComplete = true;
+  private totalUsage?: ChatTurn["usage"];
+  private lastUsage?: ChatTurn["usage"];
   private readonly toolCalls: ChatTurn["toolCalls"] = [];
   private waiter?: {
     input: ChatRequest;
@@ -784,7 +798,7 @@ class CodexSession {
     });
   }
 
-  static async create(input: ChatRequest, options: RunOptions, native?: ResponsesRequest) {
+  static async create(input: ChatRequest, options: RunOptions, native?: { request: ResponsesRequest; plan: NativePlan; onItem?: (item: NativeItem) => void }) {
     if (options.signal?.aborted) throw codexHandshakeError("aborted");
     const timeoutMs = codexHandshakeTimeoutMs();
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
@@ -799,6 +813,8 @@ class CodexSession {
         // skills or profile tools that could collide with their names.
         const nativeHome = join(cwd, ".codex");
         await mkdir(nativeHome);
+        // Codex 0.163's file store truncates auth.json in place, following this
+        // link, so refreshes persist without copying stale credentials back.
         for (const file of ["auth.json", "models_cache.json"]) {
           const source = join(codexEnvironment(cwd).CODEX_HOME, file);
           if (existsSync(source)) await symlink(source, join(nativeHome, file));
@@ -854,7 +870,7 @@ class CodexSession {
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
     try {
-      if (native) session.native = { request: native, plan: nativePlan(native), output: [], active: false };
+      if (native) session.native = { ...native, output: [] };
       await session.initialize(input);
       return session;
     } catch (error) {
@@ -923,6 +939,7 @@ class CodexSession {
   async startNative(input: ChatRequest, options: RunOptions): Promise<NativeTurn> {
     const native = this.native!;
     const result = this.wait(input, options);
+    void result.catch(() => {});
     // Injection uses the app-server's Responses-item contract, never a user transcript.
     try {
       await this.client.request("thread/inject_items", { threadId: this.threadId, items: [
@@ -930,7 +947,6 @@ class CodexSession {
         ...(native.plan.currentTools.length ? [{ type: "additional_tools", role: "developer", tools: native.plan.currentTools }] : []),
         ...native.plan.history
       ] });
-      native.active = true;
       await this.client.request("turn/start", { threadId: this.threadId, input: [],
         ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}), summary: native.request.reasoning?.summary ?? "concise" });
     } catch (error) { void this.close(error instanceof Error ? error : new Error("Native Responses turn failed")); }
@@ -941,41 +957,40 @@ class CodexSession {
   private nativeItem(item: NativeItem) {
     const native = this.native!;
     if (item.type === "additional_tools" || (item.type === "message" && item.role !== "assistant")) return;
-    if (!native.active) return; // inject_items also echoes historical raw events.
+    if (!native.turnId) return; // inject_items can echo after its RPC reply, before turn/started.
     if (item.type === "function_call" && item.namespace === "tool_search" && item.name === "tool_search_tool") {
-      if (!native.plan.discovery || native.request.tool_choice === "none") nativeError("Undeclared native tool_search call.");
+      if (!native.plan.discovery || native.request.tool_choice === "none") nativeUpstreamError("Undeclared native tool_search call.");
       item = { type: "tool_search_call", id: item.id, call_id: item.call_id, status: "completed",
-        execution: native.plan.discovery.execution ?? "server", arguments: JSON.parse(String(item.arguments)) };
+        execution: native.plan.discovery.execution ?? "server", arguments: nativeArguments(item.arguments) };
     }
-    if (["custom_tool_call", "custom_tool_call_output"].includes(String(item.type))) nativeError("Codex built-in operation refused in native Responses.");
+    if (["custom_tool_call", "custom_tool_call_output"].includes(String(item.type))) nativeUpstreamError("Codex built-in operation refused in native Responses.");
     if (!["message", "reasoning", "function_call", "tool_search_call", "tool_search_output"].includes(String(item.type))) {
-      nativeError(`Unexpected native response item: ${item.type}`);
+      nativeUpstreamError(`Unexpected native response item: ${item.type}`);
     }
     if (item.type === "function_call") {
       const ns = item.namespace === "functions" || item.namespace === "" ? undefined : item.namespace;
       const allowed = native.plan.registry.has(`${ns ?? ""}/${item.name}`);
-      if (native.request.tool_choice === "none" || !allowed) nativeError(`Unknown native host function: ${ns ?? ""}/${item.name}`);
-      const args: unknown = JSON.parse(String(item.arguments));
-      if (!args || typeof args !== "object" || Array.isArray(args)) nativeError("Native function arguments must be an object.");
+      if (native.request.tool_choice === "none" || !allowed) nativeUpstreamError(`Unknown native host function: ${ns ?? ""}/${item.name}`);
+      nativeArguments(item.arguments);
       item = { ...item, ...(ns ? { namespace: ns } : {}) };
       if (!ns) delete item.namespace;
     }
     if (item.type === "tool_search_call" || item.type === "tool_search_output") item = { ...item, call_id: item.call_id ?? null };
     if (item.type === "tool_search_call") {
-      if (!native.plan.discovery || native.request.tool_choice === "none") nativeError("Undeclared native search call.");
-      if (!item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) nativeError("Native search arguments must be an object.");
+      if (!native.plan.discovery || native.request.tool_choice === "none") nativeUpstreamError("Undeclared native search call.");
+      if (!item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) nativeUpstreamError("Native search arguments must be an object.");
       const expected = native.plan.discovery.execution ?? "server";
-      if (item.execution !== expected) nativeError("Upstream native search execution differs from the request.");
+      if (item.execution !== expected) nativeUpstreamError("Upstream native search execution differs from the request.");
     }
     if (item.type === "function_call" || (item.type === "tool_search_call" && (item.execution === "client" || item.call_id != null))) {
-      if (typeof item.call_id !== "string" || !item.call_id || native.output.some(i => i.call_id === item.call_id) || native.plan.history.some(i => i.call_id === item.call_id)) nativeError("Missing, stale or duplicate native call_id.");
+      if (typeof item.call_id !== "string" || !item.call_id || native.output.some(i => i.call_id === item.call_id) || native.plan.history.some(i => i.call_id === item.call_id)) nativeUpstreamError("Missing, stale or duplicate native call_id.");
     }
     if (item.type === "tool_search_output") {
-      if (item.execution !== "server") nativeError("Unexpected client search output from Codex.");
-      validateNativeTools(item.tools);
+      if (item.execution !== "server") nativeUpstreamError("Unexpected client search output from Codex.");
+      try { validateNativeTools(item.tools); } catch { nativeUpstreamError("Codex returned invalid native tool definitions."); }
       const calls = native.output.filter(i => i.type === "tool_search_call" && i.execution === "server" && i.call_id === item.call_id);
       const outputs = native.output.filter(i => i.type === "tool_search_output" && i.call_id === item.call_id);
-      if (calls.length <= outputs.length) nativeError("Native hosted output has no matching search call.");
+      if (calls.length <= outputs.length) nativeUpstreamError("Native hosted output has no matching search call.");
     }
     // app-server raw items carry internal chat metadata; expose only Responses fields.
     const fields = item.type === "message" ? ["type", "role", "content", "phase"]
@@ -989,6 +1004,7 @@ class CodexSession {
         annotations: record(part).annotations ?? [], logprobs: record(part).logprobs ?? [] } : part);
     if (item.type === "tool_search_call" || item.type === "tool_search_output") completed.call_id = item.call_id ?? null;
     native.output.push(completed);
+    native.onItem?.(completed);
   }
 
   private wait(input: ChatRequest, options: RunOptions) {
@@ -1019,7 +1035,7 @@ class CodexSession {
     }
     if (this.native && message.method === "turn/completed") {
       if (record(params.turn).status !== "completed") { void this.close(codexError(record(params.turn).error)); return; }
-      if (!this.native.output.length) { void this.close(new Error("Codex returned no native response items")); return; }
+      if (!this.native.output.length) nativeUpstreamError("Codex returned no native response items");
       this.resolve({ content: null, toolCalls: [], finishReason: "stop", usage: this.usage });
       void this.close();
       return;
@@ -1033,8 +1049,9 @@ class CodexSession {
     ) {
       this.waiter?.options.onDelta?.({ reasoning_content: params.delta });
     } else if (message.method === "thread/tokenUsage/updated") {
-      const total = tokenUsage({ tokenUsage: { last: record(params.tokenUsage).total } });
-      this.usage = total ?? (!this.rawUsage ? tokenUsage(params) : undefined) ?? this.usage;
+      this.totalUsage = tokenUsage({ tokenUsage: { last: record(params.tokenUsage).total } }) ?? this.totalUsage;
+      this.lastUsage = tokenUsage(params) ?? this.lastUsage;
+      this.updateUsage();
     } else if (message.method === "rawResponseItem/completed") {
       const item = record(params.item);
       if (item.type === "custom_tool_call") {
@@ -1077,8 +1094,8 @@ class CodexSession {
           totalTokens: (this.rawUsage?.totalTokens ?? 0) + next.totalTokens,
           reasoningTokens: (this.rawUsage?.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0),
         };
-        this.usage = this.rawUsage;
-      }
+      } else this.rawUsageComplete = false;
+      this.updateUsage();
       if (this.native) {
         // Return external calls before Codex tries to execute an undeclared host operation.
         if (this.native.output.some(i => i.type === "function_call" || i.type === "tool_search_call")) {
@@ -1121,6 +1138,12 @@ class CodexSession {
     } else if (message.method?.includes("requestApproval")) {
       void this.close(new Error(`Codex built-in operation refused: ${message.method}`));
     }
+  }
+
+  private updateUsage() {
+    // Sum exact upstream completions; cumulative turn usage only fills missing reports.
+    this.usage = this.rawUsage && this.rawUsageComplete ? this.rawUsage
+      : this.totalUsage ?? this.rawUsage ?? this.lastUsage;
   }
 
   private resolve(turn: ChatTurn) {
@@ -1194,16 +1217,15 @@ export const runCodex: ChatRunner = async (input, options = {}) => {
 
 /** Native Responses history and tool metadata never pass through Chat Completions. */
 export const runCodexResponses: NativeRunner = async (input, options = {}) => {
-  nativePlan(input);
+  const plan = options.plan ?? nativePlan(input);
   const chat: ChatRequest = { model: input.model, messages: [], tools: [], tool_choice: "auto", stream: false,
     ...(input.reasoning?.effort ? { reasoning_effort: input.reasoning.effort } : {}) };
-  const session = await CodexSession.create(chat, { signal: options.signal }, input);
+  const session = await CodexSession.create(chat, { signal: options.signal }, { request: input, plan, onItem: options.onItem });
   try {
     const turn = await session.startNative(chat, { signal: options.signal });
     const unresolved = turn.output.some(i => i.type === "tool_search_call" && i.execution === "server" &&
       !turn.output.some(o => o.type === "tool_search_output" && o.call_id === i.call_id));
-    if (unresolved) throw Object.assign(new Error("Codex did not execute server-side native tool_search. Use client execution with a single catalog executor; no hosted search was emulated."), { status: 502 });
-    for (const item of turn.output) options.onItem?.(item);
+    if (unresolved) nativeUpstreamError("Codex did not execute server-side native tool_search. Use client execution with a single catalog executor; no hosted search was emulated.");
     return turn;
   } finally { await session.close(); }
 };

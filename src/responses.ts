@@ -383,11 +383,11 @@ export async function respondResponses(
     if (control) badRequest(`Native Responses does not support ${control}.`);
     if (input.reasoning?.summary != null && !["auto", "concise", "detailed", "none"].includes(input.reasoning.summary)) badRequest("Unsupported native reasoning.summary.");
     if (input.max_output_tokens != null || input.temperature != null || input.top_p != null) badRequest("Native Responses does not expose output-token or sampling controls.");
-    nativePlan(input);
+    const plan = nativePlan(input);
     if (!nativeRunner) badRequest("This adapter does not support native Responses discovery.");
     const context = { id: itemId("resp"), created: Math.floor(Date.now() / 1000), request: input };
     if (!input.stream) {
-      const turn = await nativeRunner(input, { signal });
+      const turn = await nativeRunner(input, { signal, plan });
       return Response.json(responsePayload(context, "completed", turn.output, { content: null, toolCalls: [], finishReason: "stop", usage: turn.usage }));
     }
     const encoder = new TextEncoder();
@@ -405,7 +405,7 @@ export async function respondResponses(
         });
         send("response.created", { response: responsePayload(context, "in_progress", []) });
         send("response.in_progress", { response: responsePayload(context, "in_progress", []) });
-        void nativeRunner(input, { signal: combined, onItem(item) {
+        void nativeRunner(input, { signal: combined, plan, onItem(item) {
           const base = { item_id: item.id, output_index: index };
           const initial = { ...item, status: "in_progress",
             ...(item.type === "function_call" ? { arguments: "" } : {}),
