@@ -1,10 +1,11 @@
+import { nativePlan } from "../src/native-responses.js";
 import { expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closeCodexSessions, codexError, discoverCodexModels, runCodex } from "../src/codex.js";
+import { closeCodexSessions, codexError, discoverCodexModels, runCodex, runCodexResponses } from "../src/codex.js";
 import { chatRequestSchema, errorPayload, errorStatus, respond, type ChatDelta } from "../src/protocol.js";
-import { respondResponses, responsesRequestSchema } from "../src/responses.js";
+import { respondResponses, responsesRequestSchema, toChatRequest } from "../src/responses.js";
 
 // Uses real stdio/process cleanup, but never a real account or model request.
 async function withCodex(script: string, check: (directory: string) => Promise<void>) {
@@ -281,5 +282,247 @@ test("leaves namespaced native discovery to Codex and sums every model response"
     const result = await runCodex(input);
     expect(result.toolCalls).toEqual([{ id: "host", name: "lookup", arguments: {} }]);
     expect(result.usage).toEqual({ promptTokens: 30, completionTokens: 8, totalTokens: 38, reasoningTokens: 3 });
+  });
+});
+
+const nativeSearch = { type: "tool_search", execution: "client", description: "Find shipping delivery tools.",
+  parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false } };
+const shipping = { type: "namespace", name: "shipping", description: "Delivery dates and shipment status.", tools: [
+  { type: "function", name: "get_eta", description: "Get estimated delivery date", strict: true, defer_loading: true,
+    parameters: { type: "object", properties: { order_id: { type: "string" } }, required: ["order_id"], additionalProperties: false } }
+] };
+const nativeFixture = `
+let history;
+if (request.method === "thread/start") {
+  if (request.params.dynamicTools.length) process.exit(8);
+  send({ id: request.id, result: { thread: { id: "native" } } });
+} else if (request.method === "thread/inject_items") {
+  globalThis.history = request.params.items;
+  for (const item of globalThis.history) send({ method: "rawResponseItem/completed", params: { item } });
+  send({ id: request.id, result: {} });
+} else if (request.method === "turn/start") {
+  if (request.params.input.length) process.exit(9);
+  send({ id: request.id, result: {} });
+  const h = globalThis.history;
+  let item;
+  if (h.some(i => i.type === "function_call_output")) item = { type: "message", id: "msg", role: "assistant", content: [{ type: "output_text", text: "Delivery October 22", internal_metadata: "do not expose" }] };
+  else if (h.some(i => i.type === "tool_search_output")) item = { type: "function_call", id: "fc", call_id: "eta-call", namespace: "shipping", name: "get_eta", arguments: '{"order_id":"123"}' };
+  else item = { type: "function_call", id: "ts", call_id: "search-call", namespace: "tool_search", name: "tool_search_tool", arguments: '{"query":"shipping delivery"}' };
+  send({ method: "rawResponseItem/completed", params: { item } });
+  send({ method: "rawResponse/completed", params: { usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 } } });
+  if (item.type === "message") send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+}`;
+
+test("native client discovery round-trips schemas, namespaces, call IDs and results without chat flattening", async () => {
+  await withCodex(nativeFixture, async directory => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery for order 123", tools: [nativeSearch] });
+    const first = await runCodexResponses(request);
+    expect(first.output).toMatchObject([{ type: "tool_search_call", execution: "client", call_id: "search-call", arguments: { query: "shipping delivery" } }]);
+    expect(first.usage?.totalTokens).toBe(15);
+    const history = [{ role: "user", content: request.input }, ...first.output,
+      { type: "tool_search_output", call_id: "search-call", execution: "client", status: "completed", tools: [shipping] }];
+    const second = await runCodexResponses(responsesRequestSchema.parse({ ...request, input: history }));
+    expect(second.output).toMatchObject([{ type: "function_call", namespace: "shipping", name: "get_eta", call_id: "eta-call" }]);
+    const third = await runCodexResponses(responsesRequestSchema.parse({ ...request, input: [...history, ...second.output,
+      { type: "function_call_output", call_id: "eta-call", output: '{"delivery_date":"2026-10-22"}' }] }));
+    expect(third.output).toMatchObject([{ type: "message", content: [{ text: "Delivery October 22", annotations: [], logprobs: [] }] }]);
+    expect(JSON.stringify(third.output)).not.toContain("internal_metadata");
+    const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const injection = requests.filter(r => r.method === "thread/inject_items").at(-1).params.items;
+    expect(injection.find((i: any) => i.type === "tool_search_output").tools).toEqual([shipping]);
+    expect(injection.find((i: any) => i.type === "function_call").namespace).toBe("shipping");
+    expect(requests.filter(r => r.method === "turn/start").every(r => r.params.input.length === 0)).toBe(true);
+  });
+});
+
+test("native JSON and SSE emit search items, function namespaces and final text", async () => {
+  await withCodex(nativeFixture, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
+    const response = await respondResponses(request, runCodex, undefined, undefined, runCodexResponses);
+    const first = await response.json() as any;
+    expect(first.output[0].type).toBe("tool_search_call");
+    const history = [{ role: "user", content: "Delivery" }, ...first.output,
+      { type: "tool_search_output", call_id: "search-call", execution: "client", status: "completed", tools: [shipping] }];
+    const callResponse = await respondResponses(responsesRequestSchema.parse({ ...request, input: history, stream: true }), runCodex, undefined, undefined, runCodexResponses);
+    const stream = await callResponse.text();
+    expect(stream).toContain('"namespace":"shipping"');
+    expect(stream).toContain('response.function_call_arguments.delta');
+    const lastResponse = await respondResponses(responsesRequestSchema.parse({ ...request, stream: true, input: [...history,
+      { type: "function_call", name: "get_eta", namespace: "shipping", call_id: "eta-call", arguments: '{}' },
+      { type: "function_call_output", call_id: "eta-call", output: 'October 22' }] }), runCodex, undefined, undefined, runCodexResponses);
+    const text = await lastResponse.text();
+    expect(text).toContain('response.output_text.delta');
+    expect(text).toContain('Delivery October 22');
+    expect(text).toContain('response.completed');
+    expect(text).toEndWith('data: [DONE]\n\n');
+  });
+});
+
+test("does not advertise a successful hosted search when Codex returns an unexecuted search", async () => {
+  await withCodex(nativeFixture, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [{ type: "tool_search" }, shipping] });
+    await expect(runCodexResponses(request)).rejects.toThrow("did not execute server-side native tool_search");
+    const response = await respondResponses({ ...request, stream: true }, runCodex, undefined, undefined, runCodexResponses);
+    const text = await response.text();
+    expect(text).toContain('response.failed');
+    expect(text).not.toContain('response.completed');
+    expect(text).not.toContain('response.output_item.done');
+  });
+});
+
+test("native discovery refuses missing executors, malformed replay and unsupported controls before spawning", async () => {
+  const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
+  await expect(respondResponses(request, runCodex)).rejects.toThrow("does not support native Responses");
+  expect(() => toChatRequest(request)).toThrow("conversion to Chat Completions would lose their contract");
+  for (const input of [
+    [{ type: "tool_search_output", call_id: "missing", status: "completed", execution: "client", tools: [shipping] }],
+    [{ type: "tool_search_call", call_id: "one", execution: "client", arguments: {} }],
+    [{ type: "tool_search_call", call_id: "one", execution: "client", arguments: {} }, { type: "tool_search_output", call_id: "one", execution: "server", status: "completed", tools: [shipping] }],
+    [{ type: "additional_tools", role: "user", tools: [shipping] }],
+    [{ type: "additional_tools", role: "developer", tools: [{ type: "web_search" }] }],
+    [{ role: "user", content: [{ type: "input_image", image_url: "file:///private" }] }]
+  ]) await expect(runCodexResponses(responsesRequestSchema.parse({ ...request, input }))).rejects.toHaveProperty("status", 400);
+  for (const extra of [{ previous_response_id: "resp_old" }, { temperature: 0.2 }, { max_output_tokens: 100 }, { tool_choice: "required" }]) {
+    await expect(respondResponses(responsesRequestSchema.parse({ ...request, ...extra }), runCodex, undefined, undefined, runCodexResponses)).rejects.toHaveProperty("status", 400);
+  }
+});
+
+test("native discovery still refuses undeclared host functions and built-in operations", async () => {
+  for (const item of [
+    { type: "function_call", namespace: "other", name: "get_eta", call_id: "x", arguments: '{}' },
+    { type: "custom_tool_call", name: "exec", call_id: "x", input: "never execute" },
+    { type: "function_call", namespace: "tool_search", name: "tool_search_tool", call_id: "x", arguments: '{}' }
+  ]) await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: ${JSON.stringify(item)} } });
+    }
+  `, async () => {
+    await expect(runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [shipping] }))).rejects.toHaveProperty("status", 400);
+  });
+});
+
+test("forwards genuine hosted native search pairs without running an extra search layer", async () => {
+  const hosted = [
+    { type: "tool_search_call", id: "hosted-search", execution: "server", call_id: null, arguments: { query: "shipping" }, status: "completed" },
+    { type: "tool_search_output", id: "hosted-result", execution: "server", call_id: null, tools: [shipping], status: "completed" },
+    { type: "function_call", id: "hosted-function", namespace: "shipping", name: "get_eta", call_id: "call-eta", arguments: '{"order_id":"123"}' }
+  ];
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      for (const item of ${JSON.stringify(hosted)}) send({ method: "rawResponseItem/completed", params: { item } });
+      send({ method: "rawResponse/completed", params: { usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } } });
+    }
+  `, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [{ type: "tool_search" }, shipping] });
+    const turn = await runCodexResponses(request);
+    expect(turn.output).toEqual(hosted.map(i => ({ ...i, status: "completed" })));
+    const replay = responsesRequestSchema.parse({ ...request, input: [{ role: "user", content: "Delivery" }, ...turn.output,
+      { type: "function_call_output", call_id: "call-eta", output: "October 22" }] });
+    expect(nativePlan(replay).history.filter(i => i.type === "tool_search_output")[0]?.call_id).toBeNull();
+  });
+});
+
+test("native cancellation terminates the owned process and does not emit a completed response", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") send({ id: request.id, result: {} });
+  `, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
+    const abort = new AbortController();
+    const promise = runCodexResponses(request, { signal: abort.signal });
+    setTimeout(() => abort.abort(), 100);
+    await expect(promise).rejects.toThrow(/aborted/);
+  });
+});
+
+test("loaded namespace subsets retain schema identity and conflicting argument contracts fail closed", () => {
+  const extra = { ...shipping.tools[0]!, name: "get_status" };
+  const request = responsesRequestSchema.parse({ model: "test", tools: [nativeSearch, { ...shipping, tools: [...shipping.tools, extra] }], input: [
+    { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "delivery" } },
+    { type: "tool_search_output", call_id: "search", execution: "client", status: "completed", tools: [shipping] }
+  ] });
+  expect(nativePlan(request).registry.size).toBe(2);
+  expect(() => nativePlan({ ...request, input: [
+    { type: "additional_tools", role: "developer", tools: [{ ...shipping, tools: [{ ...shipping.tools[0]!, parameters: { type: "object", properties: { admin: { type: "boolean" } } } }] }] }
+  ] })).toThrow("Conflicting tool schema");
+});
+
+test("native client search preserves custom search arguments and supports the actual tool_search_call item", async () => {
+  const custom = { ...nativeSearch, parameters: { type: "object", properties: { source: { type: "string" } }, required: ["source"], additionalProperties: false } };
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: { type: "tool_search_call", id: "native-id", execution: "client", call_id: "native-call", arguments: { source: "shipping" }, status: "completed" } } });
+      send({ method: "rawResponse/completed", params: { usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 } } });
+    }
+  `, async directory => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [custom], reasoning: { summary: "detailed" } });
+    const response = await respondResponses({ ...request, stream: true }, runCodex, undefined, undefined, runCodexResponses);
+    const stream = await response.text();
+    expect(stream).toContain('"arguments":{"source":"shipping"}');
+    expect(stream).toContain('"call_id":"native-call"');
+    expect(stream).toContain('response.output_item.done');
+    const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(requests.find(r => r.method === "thread/inject_items").params.items[0].tools[0]).toEqual(custom);
+    expect(requests.find(r => r.method === "turn/start").params.summary).toBe("detailed");
+  });
+});
+
+test("native host-tool sessions do not inherit personal MCP configuration or skills", async () => {
+  const previous = process.env.CODEX_HOME;
+  try {
+    await withCodex(`
+      if (request.method === "thread/start") {
+        const config = process.env.CODEX_HOME;
+        let inherited = false;
+        try { readFileSync(config + "/config.toml"); inherited = true; } catch {}
+        if (inherited || !process.argv.includes('web_search="disabled"')) process.exit(8);
+        if (readFileSync(config + "/auth.json", "utf8") !== "synthetic-sign-in") process.exit(9);
+        send({ id: request.id, result: { thread: { id: "test" } } });
+      }
+      if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+      if (request.method === "turn/start") {
+        send({ id: request.id, result: {} });
+        send({ method: "rawResponseItem/completed", params: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "isolated" }] } } });
+        send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+      }
+    `, async directory => {
+      process.env.CODEX_HOME = directory;
+      await writeFile(join(directory, "auth.json"), "synthetic-sign-in");
+      await writeFile(join(directory, "config.toml"), '[mcp_servers.personal]\nurl = "https://personal.invalid"\n');
+      const turn = await runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] }));
+      expect(turn.output).toMatchObject([{ content: [{ text: "isolated" }] }]);
+      expect(await readFile(join(directory, "config.toml"), "utf8")).toContain("personal.invalid");
+    });
+  } finally { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; }
+});
+
+test("native replay filters history by turn ID and rejects reusing an old host call ID", async () => {
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") send({ id: request.id, result: {} });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "turn/started", params: { turn: { id: "active" } } });
+      send({ method: "rawResponseItem/completed", params: { turnId: "history", item: { type: "function_call", name: "not-allowed", call_id: "history-call", arguments: '{}' } } });
+      send({ method: "rawResponseItem/completed", params: { turnId: "active", item: { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "eta-call", arguments: '{}' } } });
+      send({ method: "rawResponse/completed", params: { turnId: "active", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } });
+    }
+  `, async () => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [shipping] });
+    expect((await runCodexResponses(request)).output).toMatchObject([{ call_id: "eta-call" }]);
+    await expect(runCodexResponses(responsesRequestSchema.parse({ ...request, input: [
+      { type: "function_call", namespace: "shipping", name: "get_eta", call_id: "eta-call", arguments: '{}' },
+      { type: "function_call_output", call_id: "eta-call", output: 'old result' }
+    ] }))).rejects.toThrow("stale or duplicate");
   });
 });

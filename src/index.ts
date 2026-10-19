@@ -1,3 +1,4 @@
+import { usesNativeResponses } from "./native-responses.js";
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createServer,
@@ -12,7 +13,8 @@ import {
   closeCodexSessions,
   detectCodex,
   runCodex,
-  runCodexImage
+  runCodexImage,
+  runCodexResponses
 } from "./codex.js";
 import {
   closeGrokSessions,
@@ -564,8 +566,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     if (authState !== "auth_required") return failure;
     return Object.assign(failure, { status: 401, category: "auth_required" });
   };
-  const guardedRunner = (adapterId: AdapterId, run: ChatRunner): ChatRunner =>
-    async (input, runOptions) => {
+  const guardedRunner = <Input, Options, Output>(adapterId: AdapterId, run: (input: Input, options?: Options) => Promise<Output>) =>
+    async (input: Input, runOptions?: Options): Promise<Output> => {
       try {
         return await run(input, runOptions);
       } catch (error) {
@@ -921,7 +923,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         const usesImage = parsed.data.tools?.some(
           (tool) => tool.type === "image_generation"
         ) ?? false;
-        const chatInput = usesImage ? undefined : toChatRequest(parsed.data);
+        const chatInput = usesImage || usesNativeResponses(parsed.data) ? undefined : toChatRequest(parsed.data);
         if (chatInput) validateInputs(chatInput, adapterCapability);
         const capability = usesImage ? adapterCapability : undefined;
         const image =
@@ -952,7 +954,14 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
             parsed.data,
             runTurn,
             controller.signal,
-            image
+            image,
+            adapter === "codex" ? async (input, options) => {
+              try {
+                const turn = await guardedRunner(adapter, runCodexResponses)(input, options);
+                logInfo.outcome = "completed";
+                return turn;
+              } catch (error) { recordFailure(error); throw error; }
+            } : undefined
           ),
           response
         );

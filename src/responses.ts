@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { usesNativeResponses, nativePlan, type NativeRunner } from "./native-responses.js";
 import {
   chatRequestSchema,
   samplingFields,
@@ -34,9 +35,9 @@ const itemSchema = z
     type: z.string().optional(),
     role: z.string().optional(),
     content: itemContent.optional(),
-    call_id: z.string().optional(),
+    call_id: z.string().nullish(),
     name: z.string().optional(),
-    arguments: z.string().optional(),
+    arguments: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
     output: itemContent.optional()
   })
   .passthrough();
@@ -158,7 +159,7 @@ function messageContent(
  * answering with defaults would misreport what actually ran, so any
  * effective value is refused instead of silently dropped.
  */
-function unsupportedControl(input: ResponsesRequest) {
+export function unsupportedControl(input: ResponsesRequest) {
   if (input.store) return "store: true";
   if (input.top_logprobs) return "top_logprobs";
   if (input.max_tool_calls != null) return "max_tool_calls";
@@ -190,6 +191,7 @@ function unsupportedControl(input: ResponsesRequest) {
 }
 
 export function toChatRequest(input: ResponsesRequest): ChatRequest {
+  if (usesNativeResponses(input)) badRequest("Native Responses items and tool metadata require a native Responses runner; conversion to Chat Completions would lose their contract.");
   if (input.previous_response_id) {
     badRequest(
       "previous_response_id is not supported: this bridge is stateless, send the full input array."
@@ -230,10 +232,11 @@ export function toChatRequest(input: ResponsesRequest): ChatRequest {
       if (!item.call_id || !item.name) {
         badRequest("function_call items need call_id and name.");
       }
+      if (item.arguments != null && typeof item.arguments !== "string") badRequest("function_call arguments must be a JSON string.");
       const call = {
         id: item.call_id,
         type: "function",
-        function: { name: item.name, arguments: item.arguments ?? "{}" }
+        function: { name: item.name, arguments: typeof item.arguments === "string" ? item.arguments : "{}" }
       };
       const last = messages.at(-1);
       if (last?.role === "assistant" && Array.isArray(last.tool_calls)) {
@@ -342,7 +345,7 @@ function responsePayload(
     previous_response_id: null,
     reasoning: {
       effort: context.request.reasoning?.effort ?? null,
-      summary: null
+      summary: context.request.reasoning?.summary ?? null
     },
     store: false,
     // The runtime does not report its effective sampling settings.
@@ -372,8 +375,76 @@ export async function respondResponses(
   input: ResponsesRequest,
   runner: ChatRunner,
   signal?: AbortSignal,
-  imageRunner?: ImageRunner
+  imageRunner?: ImageRunner,
+  nativeRunner?: NativeRunner
 ) {
+  if (usesNativeResponses(input)) {
+    const control = unsupportedControl({ ...input, reasoning: input.reasoning ? { ...input.reasoning, summary: undefined } : undefined });
+    if (control) badRequest(`Native Responses does not support ${control}.`);
+    if (input.reasoning?.summary != null && !["auto", "concise", "detailed", "none"].includes(input.reasoning.summary)) badRequest("Unsupported native reasoning.summary.");
+    if (input.max_output_tokens != null || input.temperature != null || input.top_p != null) badRequest("Native Responses does not expose output-token or sampling controls.");
+    nativePlan(input);
+    if (!nativeRunner) badRequest("This adapter does not support native Responses discovery.");
+    const context = { id: itemId("resp"), created: Math.floor(Date.now() / 1000), request: input };
+    if (!input.stream) {
+      const turn = await nativeRunner(input, { signal });
+      return Response.json(responsePayload(context, "completed", turn.output, { content: null, toolCalls: [], finishReason: "stop", usage: turn.usage }));
+    }
+    const encoder = new TextEncoder();
+    const abort = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let sequence = 0;
+        let index = 0;
+        const send = (type: string, payload: Record<string, unknown>) => {
+          if (!abort.signal.aborted) controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...payload })}\n\n`));
+        };
+        const heartbeat = startSseHeartbeat(() => {
+          if (!abort.signal.aborted) controller.enqueue(encoder.encode(": keep-alive\n\n"));
+        });
+        send("response.created", { response: responsePayload(context, "in_progress", []) });
+        send("response.in_progress", { response: responsePayload(context, "in_progress", []) });
+        void nativeRunner(input, { signal: combined, onItem(item) {
+          const base = { item_id: item.id, output_index: index };
+          const initial = { ...item, status: "in_progress",
+            ...(item.type === "function_call" ? { arguments: "" } : {}),
+            ...(item.type === "message" ? { content: [] } : {}),
+            ...(item.type === "reasoning" ? { summary: [] } : {}) };
+          send("response.output_item.added", { output_index: index, item: initial });
+          if (item.type === "function_call") {
+            send("response.function_call_arguments.delta", { ...base, delta: item.arguments });
+            send("response.function_call_arguments.done", { ...base, arguments: item.arguments });
+          }
+          if (item.type === "message" && Array.isArray(item.content)) {
+            item.content.forEach((part, content_index) => {
+              if (part.type !== "output_text") return;
+              const at = { ...base, content_index };
+              send("response.content_part.added", { ...at, part: { ...part, text: "" } });
+              send("response.output_text.delta", { ...at, delta: part.text, logprobs: [] });
+              send("response.output_text.done", { ...at, text: part.text, logprobs: [] });
+              send("response.content_part.done", { ...at, part });
+            });
+          }
+          if (item.type === "reasoning" && Array.isArray(item.summary)) {
+            item.summary.forEach((part, summary_index) => {
+              const at = { ...base, summary_index };
+              send("response.reasoning_summary_part.added", { ...at, part: { ...part, text: "" } });
+              send("response.reasoning_summary_text.delta", { ...at, delta: part.text });
+              send("response.reasoning_summary_text.done", { ...at, text: part.text });
+              send("response.reasoning_summary_part.done", { ...at, part });
+            });
+          }
+          send("response.output_item.done", { output_index: index++, item });
+        } }).then(turn => {
+          send("response.completed", { response: responsePayload(context, "completed", turn.output, { content: null, toolCalls: [], finishReason: "stop", usage: turn.usage }) });
+        }).catch(error => {
+          send("response.failed", { response: { ...responsePayload(context, "completed", []), status: "failed", error: errorPayload(error) } });
+        }).finally(() => { heartbeat.stop(); if (!abort.signal.aborted) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); } });
+      }, cancel() { abort.abort(); }
+    });
+    return new Response(body, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+  }
   const imageTools = (input.tools ?? []).filter((tool) => tool.type === "image_generation");
   if (imageTools.length) {
     if (!imageRunner) badRequest("This adapter does not support image_generation.");
