@@ -67,7 +67,7 @@ test("pins cached model metadata to direct host tools without changing the nativ
         const option = process.argv.find(arg => arg.startsWith("model_catalog_json="));
         const catalog = JSON.parse(readFileSync(JSON.parse(option.split("=").slice(1).join("=")), "utf8"));
         if (catalog.models.length !== 1 || catalog.models[0].slug !== "test" ||
-            catalog.models[0].tool_mode !== "direct" || catalog.models[0].supports_search_tool !== false || catalog.models[0].shell_type !== "disabled" ||
+            catalog.models[0].tool_mode !== "direct" || catalog.models[0].supports_search_tool !== true || catalog.models[0].shell_type !== "disabled" ||
             catalog.models[0].context_window !== 123456 ||
             catalog.models[0].experimental_supported_tools.length !== 0) process.exit(7);
         send({ id: request.id, result: { thread: { id: "test" } } });
@@ -246,8 +246,8 @@ test("keeps batch names collision-free and respects named/none tool selection", 
   });
 });
 
-test("unknown native discovery and foreign namespaces remain refused", async () => {
-  for (const [name, namespace] of [["tool_search_tool", "tool_search"], ["tool_search_tool", null], ["lookup", "private_mcp"]]) {
+test("unnamespaced discovery and foreign namespaces remain refused", async () => {
+  for (const [name, namespace] of [["tool_search_tool", null], ["tool_search_tool", "functions"], ["lookup", "private_mcp"], ["lookup", "tool_search"]]) {
     await withCodex(`
       if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
       if (request.method === "turn/start") {
@@ -258,4 +258,28 @@ test("unknown native discovery and foreign namespaces remain refused", async () 
       }
     `, async () => { await expect(runCodex(input)).rejects.toThrow("unknown host tool call"); });
   }
+});
+
+test("leaves namespaced native discovery to Codex and sums every model response", async () => {
+  for (const reportFinalUsage of [true, false]) await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      send({ method: "rawResponseItem/completed", params: { item: {
+        type: "function_call", call_id: "native", namespace: "tool_search", name: "tool_search_tool", arguments: "{}"
+      } } });
+      send({ method: "rawResponse/completed", params: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningOutputTokens: 2 } } });
+      setTimeout(() => {
+        send({ method: "thread/tokenUsage/updated", params: { tokenUsage: { last: { inputTokens: 20, outputTokens: 3, totalTokens: 23 }, total: { inputTokens: 30, outputTokens: 8, totalTokens: 38, reasoningOutputTokens: 3 } } } });
+        send({ method: "rawResponseItem/completed", params: { item: {
+          type: "function_call", call_id: "host", namespace: "functions", name: "lookup", arguments: "{}"
+        } } });
+        send({ method: "rawResponse/completed", params: ${JSON.stringify(reportFinalUsage ? { usage: { inputTokens: 20, outputTokens: 3, totalTokens: 23, reasoningOutputTokens: 1 } } : {})} });
+      }, 25);
+    }
+  `, async () => {
+    const result = await runCodex(input);
+    expect(result.toolCalls).toEqual([{ id: "host", name: "lookup", arguments: {} }]);
+    expect(result.usage).toEqual({ promptTokens: 30, completionTokens: 8, totalTokens: 38, reasoningTokens: 3 });
+  });
 });

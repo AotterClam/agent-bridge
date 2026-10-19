@@ -751,6 +751,7 @@ class CodexSession {
   private content = "";
   private stderr = "";
   private usage?: ChatTurn["usage"];
+  private rawUsage?: ChatTurn["usage"];
   private readonly toolCalls: ChatTurn["toolCalls"] = [];
   private waiter?: {
     input: ChatRequest;
@@ -784,7 +785,6 @@ class CodexSession {
     const timeoutMs = codexHandshakeTimeoutMs();
     const cwd = await mkdtemp(join(tmpdir(), "agent-bridge-codex-"));
     // Model metadata can select code_mode_only even when its feature is disabled.
-    // Disable native discovery too: the external host owns the declared tool catalog.
     // Use Codex's native catalog override for this session; keep its cache untouched.
     let catalog: string | undefined;
     try {
@@ -795,7 +795,7 @@ class CodexSession {
         const model = Array.isArray(models) ? models.find((model) => record(model).slug === input.model) : undefined;
         if (model) {
           catalog = join(cwd, "host-model.json");
-          await writeFile(catalog, JSON.stringify({ models: [{ ...model, tool_mode: "direct", supports_search_tool: false, shell_type: "disabled", experimental_supported_tools: [] }] }), { mode: 0o600 });
+          await writeFile(catalog, JSON.stringify({ models: [{ ...model, tool_mode: "direct", shell_type: "disabled", experimental_supported_tools: [] }] }), { mode: 0o600 });
         }
       }
     } catch (error) {
@@ -930,13 +930,16 @@ class CodexSession {
     ) {
       this.waiter?.options.onDelta?.({ reasoning_content: params.delta });
     } else if (message.method === "thread/tokenUsage/updated") {
-      this.usage = tokenUsage(params) ?? this.usage;
+      const total = tokenUsage({ tokenUsage: { last: record(params.tokenUsage).total } });
+      this.usage = total ?? (!this.rawUsage ? tokenUsage(params) : undefined) ?? this.usage;
     } else if (message.method === "rawResponseItem/completed") {
       const item = record(params.item);
       if (item.type === "custom_tool_call") {
         throw new Error(`Codex built-in operation refused: ${String(item.name)}`);
       }
       if (item.type !== "function_call") return;
+      // Native discovery executes inside Codex; only declared host calls cross this boundary.
+      if (item.namespace === "tool_search" && item.name === "tool_search_tool") return;
       try {
         if (typeof item.call_id !== "string" || !item.call_id || !this.waiter ||
             (item.namespace != null && item.namespace !== "" && item.namespace !== "functions")) {
@@ -962,10 +965,20 @@ class CodexSession {
       } catch (error) {
         void this.close(error instanceof Error ? error : new Error("Invalid Codex tool call"));
       }
-    } else if (message.method === "rawResponse/completed" && this.toolCalls.length) {
+    } else if (message.method === "rawResponse/completed") {
+      const next = tokenUsage({ tokenUsage: { last: params.usage } });
+      if (next) {
+        this.rawUsage = {
+          promptTokens: (this.rawUsage?.promptTokens ?? 0) + next.promptTokens,
+          completionTokens: (this.rawUsage?.completionTokens ?? 0) + next.completionTokens,
+          totalTokens: (this.rawUsage?.totalTokens ?? 0) + next.totalTokens,
+          reasoningTokens: (this.rawUsage?.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0),
+        };
+        this.usage = this.rawUsage;
+      }
+      if (!this.toolCalls.length) return;
       // This is the model-response boundary, before Codex waits for dynamic tool
       // results. item/tool/call may be serialized, so it cannot delimit a batch.
-      this.usage = tokenUsage({ tokenUsage: { last: params.usage } }) ?? this.usage;
       if (this.content) this.waiter?.options.onDelta?.({ content: this.content });
       this.toolCalls.forEach((call, index) => this.emitCall(call, index));
       this.resolve({ content: this.content || null, toolCalls: this.toolCalls,
