@@ -67,7 +67,7 @@ test("pins cached model metadata to direct host tools without changing the nativ
         const option = process.argv.find(arg => arg.startsWith("model_catalog_json="));
         const catalog = JSON.parse(readFileSync(JSON.parse(option.split("=").slice(1).join("=")), "utf8"));
         if (catalog.models.length !== 1 || catalog.models[0].slug !== "test" ||
-            catalog.models[0].tool_mode !== "direct" || catalog.models[0].shell_type !== "disabled" ||
+            catalog.models[0].tool_mode !== "direct" || catalog.models[0].supports_search_tool !== false || catalog.models[0].shell_type !== "disabled" ||
             catalog.models[0].context_window !== 123456 ||
             catalog.models[0].experimental_supported_tools.length !== 0) process.exit(7);
         send({ id: request.id, result: { thread: { id: "test" } } });
@@ -79,7 +79,7 @@ test("pins cached model metadata to direct host tools without changing the nativ
     `, async (directory) => {
       process.env.CODEX_HOME = directory;
       const cache = JSON.stringify({ identity: "do not copy", models: [
-        { slug: "test", tool_mode: "code_mode_only", shell_type: "unified_exec", context_window: 123456, experimental_supported_tools: ["clock"] },
+        { slug: "test", supports_search_tool: true, tool_mode: "code_mode_only", shell_type: "unified_exec", context_window: 123456, experimental_supported_tools: ["clock"] },
         { slug: "other", tool_mode: "code_mode_only" }
       ] });
       await writeFile(join(directory, "models_cache.json"), cache);
@@ -244,4 +244,18 @@ test("keeps batch names collision-free and respects named/none tool selection", 
     expect(starts[2].dynamicTools).toEqual([]);
     expect(starts[2].baseInstructions).not.toContain("__agent_bridge_batch");
   });
+});
+
+test("unknown native discovery and foreign namespaces remain refused", async () => {
+  for (const [name, namespace] of [["tool_search_tool", "tool_search"], ["tool_search_tool", null], ["lookup", "private_mcp"]]) {
+    await withCodex(`
+      if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+      if (request.method === "turn/start") {
+        send({ id: request.id, result: {} });
+        send({ method: "rawResponseItem/completed", params: { item: {
+          type: "function_call", call_id: "unknown", name: ${JSON.stringify(name)}, namespace: ${JSON.stringify(namespace)}, arguments: "{}"
+        } } });
+      }
+    `, async () => { await expect(runCodex(input)).rejects.toThrow("unknown host tool call"); });
+  }
 });
