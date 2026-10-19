@@ -961,7 +961,7 @@ class CodexSession {
     if (item.type === "function_call" && item.namespace === "tool_search" && item.name === "tool_search_tool") {
       if (!native.plan.discovery || native.request.tool_choice === "none") nativeUpstreamError("Undeclared native tool_search call.");
       item = { type: "tool_search_call", id: item.id, call_id: item.call_id, status: "completed",
-        execution: native.plan.discovery.execution ?? "server", arguments: nativeArguments(item.arguments) };
+        execution: native.plan.discovery.execution ?? "server", arguments: nativeArguments(item.arguments), encrypted_content: item.encrypted_content };
     }
     if (["custom_tool_call", "custom_tool_call_output"].includes(String(item.type))) nativeUpstreamError("Codex built-in operation refused in native Responses.");
     if (!["message", "reasoning", "function_call", "tool_search_call", "tool_search_output"].includes(String(item.type))) {
@@ -993,10 +993,10 @@ class CodexSession {
       if (calls.length <= outputs.length) nativeUpstreamError("Native hosted output has no matching search call.");
     }
     // app-server raw items carry internal chat metadata; expose only Responses fields.
-    const fields = item.type === "message" ? ["type", "role", "content", "phase"]
+    const fields = item.type === "message" ? ["type", "role", "content", "phase", "encrypted_content"]
       : item.type === "reasoning" ? ["type", "summary", "content", "encrypted_content"]
-      : item.type === "function_call" ? ["type", "call_id", "name", "namespace", "arguments"]
-      : ["type", "call_id", "execution", "arguments", "tools"];
+      : item.type === "function_call" ? ["type", "call_id", "name", "namespace", "arguments", "encrypted_content"]
+      : ["type", "call_id", "execution", "arguments", "tools", "encrypted_content"];
     const completed: NativeItem = { ...Object.fromEntries(fields.filter(k => item[k] !== undefined).map(k => [k, item[k]])),
       id: item.id ?? `item_${crypto.randomUUID()}`, ...(item.type !== "reasoning" ? { status: "completed" } : {}) };
     if (item.type === "message" && Array.isArray(item.content)) completed.content = item.content.map(part =>

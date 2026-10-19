@@ -87,6 +87,20 @@ try {
   assert.equal(payload.output[0].call_id, "search-call");
   assert.deepEqual(payload.output[0].arguments, { query: "shipping" });
   assert.equal(payload.usage.total_tokens, 3);
+
+  const loadedHistory = [
+    { role: "user", content: "Shipping" },
+    { type: "tool_search_call", call_id: "loaded-search", execution: "client", arguments: { query: "shipping" } },
+    { type: "tool_search_output", call_id: "loaded-search", execution: "client", status: "completed", tools: [{ type: "function", name: "get_eta", parameters: { type: "object" } }] }
+  ];
+  for (const input of ["Shipping", loadedHistory]) {
+    for (const stream of [false, true]) {
+      const unsupported = await fetch(endpoint, { method: "POST", headers: { authorization: `Bearer ${capabilityToken("cancel-test", "codex")}`, "content-type": "application/json" }, body: JSON.stringify({ ...nativeBody, input, stream, tool_choice: "none" }) });
+      assert.equal(unsupported.status, 400);
+      assert.match(unsupported.headers.get("content-type"), /application\/json/);
+      assert.match((await unsupported.json()).error.message, /tool_choice auto only/);
+    }
+  }
 } finally {
   clearTimeout(timeout);
   await cancelBridge.close();

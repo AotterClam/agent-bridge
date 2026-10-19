@@ -390,7 +390,8 @@ Requests using `tool_search`, `namespace`, `defer_loading`, `additional_tools`,
 or search history use a separate Responses-item path. Native schemas and history
 are injected through app-server `thread/inject_items`; they are never flattened
 into a Chat Completions transcript. Namespace descriptions, deferred schemas,
-function namespaces, search arguments and call IDs survive JSON and SSE replay.
+function namespaces, search arguments, call IDs and native `encrypted_content`
+fields survive JSON and SSE replay.
 
 For client execution, declare `{ type: "tool_search", execution: "client",
 description, parameters }`. The model returns `tool_search_call`; one application
@@ -406,9 +407,12 @@ search call. That path fails explicitly rather than emulating hosted search or
 claiming a successful result. Client-native execution is locally verified;
 server execution requires a successful model/runtime probe before use.
 
-Native discovery currently accepts text input, `tool_choice: auto|none`, and
-native reasoning effort/summary. It does not expose a hard output-token cap,
-sampling controls, stored responses, item references, or mixed image tools.
+Native discovery currently accepts text input, `tool_choice: auto` (or omitted),
+and native reasoning effort/summary. Other tool choices, including `none`, fail
+with `400` before starting a CLI session: Codex 0.163.0 fixes upstream tool choice
+to `auto`, and removing current tools cannot disable tools loaded in history.
+It does not expose a hard output-token cap, sampling controls, stored responses,
+item references, or mixed image tools.
 Other adapters reject native discovery explicitly. Ordinary chat, function-only
 Responses, and image lanes keep their existing behavior.
 

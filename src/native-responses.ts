@@ -33,8 +33,8 @@ export function usesNativeResponses(input: ResponsesRequest) {
 export type NativePlan = ReturnType<typeof nativePlan>;
 export function nativePlan(input: ResponsesRequest) {
   if (input.previous_response_id) nativeError("Native Responses is stateless; send full input history.");
-  if (input.tool_choice != null && input.tool_choice !== "auto" && input.tool_choice !== "none") {
-    nativeError("Native Responses currently supports tool_choice auto or none.");
+  if (input.tool_choice != null && input.tool_choice !== "auto") {
+    nativeError("Native Responses supports tool_choice auto only; this Codex runtime cannot enforce other tool choices.");
   }
   const searches = (input.tools ?? []).filter(t => t.type === "tool_search").map(t => parse(search, t));
   if (searches.length > 1) nativeError("Only one native tool_search declaration is allowed.");
@@ -105,6 +105,6 @@ export function nativePlan(input: ResponsesRequest) {
     history.push(item);
   }
   if (pending.size) nativeError("Native history has unresolved tool calls.");
-  const currentTools = input.tool_choice === "none" ? [] : [...declared, ...(discovery ? [discovery] : [])];
+  const currentTools = [...declared, ...(discovery ? [discovery] : [])];
   return { discovery, registry, history, currentTools };
 }

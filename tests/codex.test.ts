@@ -692,3 +692,66 @@ test("native item consumer errors reject and clean up the owned session", async 
     await expect(runCodexResponses(request, { onItem() { throw new Error("consumer failed"); } })).rejects.toThrow("consumer failed");
   });
 });
+
+test("native tool_choice none fails before RPC for fresh and loaded history, JSON and SSE", async () => {
+  await withCodex(nativeFixture, async directory => {
+    const loaded = [
+      { role: "user", content: "Delivery" },
+      { type: "tool_search_call", call_id: "old-search", execution: "client", arguments: { query: "shipping" } },
+      { type: "tool_search_output", call_id: "old-search", execution: "client", status: "completed", tools: [shipping] }
+    ];
+    for (const input of ["Delivery", loaded]) {
+      const request = responsesRequestSchema.parse({ model: "test", input, tools: [nativeSearch], tool_choice: "none" });
+      await expect(runCodexResponses(request)).rejects.toMatchObject({ status: 400, message: expect.stringContaining("tool_choice auto only") });
+      for (const stream of [false, true]) {
+        await expect(respondResponses({ ...request, stream }, runCodex, undefined, undefined, runCodexResponses)).rejects.toHaveProperty("status", 400);
+      }
+    }
+    await expect(readFile(join(directory, "requests"), "utf8")).rejects.toHaveProperty("code", "ENOENT");
+  });
+});
+
+test.each([false, true])("native encrypted fields survive JSON/SSE case %# and history injection", async stream => {
+  const items = [
+    { type: "reasoning", id: "reasoning", summary: [], encrypted_content: "SYNTHETIC_REASONING" },
+    { type: "tool_search_call", call_id: "search-native", execution: "client", arguments: { query: "shipping" }, encrypted_content: "SYNTHETIC_SEARCH" },
+    { type: "function_call", call_id: "search-legacy", namespace: "tool_search", name: "tool_search_tool", arguments: '{"query":"shipping"}', encrypted_content: "SYNTHETIC_LEGACY_SEARCH" },
+    { type: "function_call", call_id: "host", namespace: "shipping", name: "get_eta", arguments: '{"order_id":"123"}', encrypted_content: "SYNTHETIC_FUNCTION" },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Synthetic delivery" }], encrypted_content: "SYNTHETIC_MESSAGE" }
+  ];
+  await withCodex(`
+    if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "test" } } });
+    if (request.method === "thread/inject_items") {
+      globalThis.replay = request.params.items.some(i => i.type === "function_call_output");
+      send({ id: request.id, result: {} });
+    }
+    if (request.method === "turn/start") {
+      send({ id: request.id, result: {} });
+      const items = globalThis.replay ? [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Replayed" }] }] : ${JSON.stringify(items)};
+      for (const item of items) send({ method: "rawResponseItem/completed", params: { item: { ...item, internal_chat_message_metadata_passthrough: { private: "NEVER_EXPOSE" } } } });
+      send({ method: "rawResponse/completed", params: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } });
+      send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    }
+  `, async directory => {
+    const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch, shipping], stream });
+    const response = await respondResponses(request, runCodex, undefined, undefined, runCodexResponses);
+    let output: any[];
+    if (stream) {
+      const body = await response.text();
+      const events = body.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
+      output = events.find(event => event.type === "response.completed").response.output;
+      expect(events.filter(event => event.type === "response.output_item.done").map(event => event.item.encrypted_content)).toEqual(items.map(item => item.encrypted_content));
+      expect(body).not.toContain("NEVER_EXPOSE");
+    } else output = (await response.json() as any).output;
+    expect(output.map(item => item.encrypted_content)).toEqual(items.map(item => item.encrypted_content));
+    expect(JSON.stringify(output)).not.toContain("NEVER_EXPOSE");
+    const replay = responsesRequestSchema.parse({ ...request, input: [{ role: "user", content: "Delivery" }, ...output,
+      ...["search-native", "search-legacy"].map(call_id => ({ type: "tool_search_output", call_id, execution: "client", status: "completed", tools: [shipping] })),
+      { type: "function_call_output", call_id: "host", output: "October 22" }
+    ] });
+    await runCodexResponses(replay);
+    const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const injected = requests.filter(request => request.method === "thread/inject_items").at(-1).params.items;
+    expect(injected.filter((item: any) => item.encrypted_content).map((item: any) => item.encrypted_content)).toEqual(items.map(item => item.encrypted_content));
+  });
+});
