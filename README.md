@@ -416,6 +416,15 @@ item references, or mixed image tools.
 Other adapters reject native discovery explicitly. Ordinary chat, function-only
 Responses, and image lanes keep their existing behavior.
 
+Unencrypted inline native history drops response item `id` fields to avoid
+unsupported persisted-item lookups. Encrypted content retains its original ID
+for verification. `call_id` pairing is preserved; `item_reference` remains unsupported.
+
+Current request tool declarations are injected after replayed history as native
+`additional_tools`. A re-enabled source therefore follows older discovery receipts
+and unavailable-source replies; no synthetic user reminder is inserted. Host
+authorization remains authoritative at function execution.
+
 Regression: `bun test tests/codex.test.ts tests/responses.test.ts`.
 Opt-in real-model smoke (uses the signed-in account, synthetic data only):
 `AGENT_BRIDGE_CODEX_SMOKE_MODEL=<model-id> bun tests/codex-native-smoke.mjs`.

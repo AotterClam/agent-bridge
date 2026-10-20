@@ -944,8 +944,10 @@ class CodexSession {
     try {
       await this.client.request("thread/inject_items", { threadId: this.threadId, items: [
         ...(native.request.instructions ? [{ type: "message", role: "developer", content: [{ type: "input_text", text: native.request.instructions }] }] : []),
-        ...(native.plan.currentTools.length ? [{ type: "additional_tools", role: "developer", tools: native.plan.currentTools }] : []),
-        ...native.plan.history
+        ...native.plan.history,
+        // Current declarations are the latest catalog snapshot, after historical
+        // discovery receipts and assistant messages from earlier availability.
+        ...(native.plan.currentTools.length ? [{ type: "additional_tools", role: "developer", tools: native.plan.currentTools }] : [])
       ] });
       await this.client.request("turn/start", { threadId: this.threadId, input: [],
         ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}), summary: native.request.reasoning?.summary ?? "concise" });

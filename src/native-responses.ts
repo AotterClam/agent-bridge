@@ -66,6 +66,9 @@ export function nativePlan(input: ResponsesRequest) {
   const history: NativeItem[] = [];
   for (const raw of typeof input.input === "string" ? [{ role: "user", content: input.input }] : input.input) {
     const item: NativeItem = { ...raw, type: raw.type ?? "message" };
+    // Unencrypted inline items must not trigger persisted-item lookup. Encrypted
+    // content is bound to its original id and must retain that id for verification.
+    if (!item.encrypted_content) delete item.id;
     if (item.type === "message") {
       if (!["system", "developer", "assistant", "user"].includes(String(item.role))) nativeError("Unsupported native message role.");
       if (typeof item.content === "string") item.content = [{ type: item.role === "assistant" ? "output_text" : "input_text", text: item.content }];

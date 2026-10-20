@@ -337,6 +337,31 @@ test("native client discovery round-trips schemas, namespaces, call IDs and resu
   });
 });
 
+test("current discovery declarations follow stale history when a source is reenabled", async () => {
+  await withCodex(nativeFixture, async directory => {
+    const unavailable = { ...nativeSearch, description: "No shipping sources available.", parameters: { type: "object", properties: { query: { type: "string", enum: [] } }, required: ["query"], additionalProperties: false } };
+    const history = [
+      { type: "additional_tools", role: "developer", tools: [shipping] },
+      { role: "user", content: "Delivery?" },
+      { type: "tool_search_call", call_id: "old-search", execution: "client", arguments: { query: "shipping" } },
+      { type: "tool_search_output", call_id: "old-search", execution: "client", status: "completed", tools: [] },
+      { role: "assistant", content: "Shipping is unavailable." },
+      { role: "user", content: "Delivery for order 123?" }
+    ];
+    await runCodexResponses(responsesRequestSchema.parse({ model: "test", input: history, tools: [nativeSearch, shipping] }));
+    const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const items = requests.find(r => r.method === "thread/inject_items").params.items;
+    expect(items.at(-1)).toEqual({ type: "additional_tools", role: "developer", tools: [shipping, nativeSearch] });
+    expect(items.slice(0, -1)).toEqual(nativePlan(responsesRequestSchema.parse({ model: "test", input: history, tools: [nativeSearch, shipping] })).history);
+    expect(items.filter((item: any) => item.type === "message").map((item: any) => item.content[0].text)).toEqual(["Delivery?", "Shipping is unavailable.", "Delivery for order 123?"]);
+    // Disabling advertises only the current discovery schema, without restoring
+    // the old source's executable declaration or injecting a reminder prompt.
+    await runCodexResponses(responsesRequestSchema.parse({ model: "test", input: "Delivery?", tools: [unavailable] }));
+    const after = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(after.filter(r => r.method === "thread/inject_items").at(-1).params.items.at(-1).tools).toEqual([unavailable]);
+  });
+});
+
 test("native JSON and SSE emit search items, function namespaces and final text", async () => {
   await withCodex(nativeFixture, async () => {
     const request = responsesRequestSchema.parse({ model: "test", input: "Delivery", tools: [nativeSearch] });
@@ -474,7 +499,7 @@ test("native client search preserves custom search arguments and supports the ac
     expect(stream).toContain('"call_id":"native-call"');
     expect(stream).toContain('response.output_item.done');
     const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    expect(requests.find(r => r.method === "thread/inject_items").params.items[0].tools[0]).toEqual(custom);
+    expect(requests.find(r => r.method === "thread/inject_items").params.items.at(-1).tools[0]).toEqual(custom);
     expect(requests.find(r => r.method === "turn/start").params.summary).toBe("detailed");
   });
 });
@@ -747,11 +772,14 @@ test.each([false, true])("native encrypted fields survive JSON/SSE case %# and h
     expect(JSON.stringify(output)).not.toContain("NEVER_EXPOSE");
     const replay = responsesRequestSchema.parse({ ...request, input: [{ role: "user", content: "Delivery" }, ...output,
       ...["search-native", "search-legacy"].map(call_id => ({ type: "tool_search_output", call_id, execution: "client", status: "completed", tools: [shipping] })),
-      { type: "function_call_output", call_id: "host", output: "October 22" }
+      { type: "function_call_output", id: "opaque-output-id", call_id: "host", output: "October 22" }
     ] });
     await runCodexResponses(replay);
     const requests = (await readFile(join(directory, "requests"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
     const injected = requests.filter(request => request.method === "thread/inject_items").at(-1).params.items;
+    expect(injected.filter((item: any) => !item.encrypted_content).every((item: any) => item.id === undefined)).toBe(true);
+    expect(injected.filter((item: any) => item.encrypted_content).map((item: any) => item.id)).toEqual(output.map(item => item.id));
+    expect(injected.find((item: any) => item.type === "function_call_output")).toMatchObject({ call_id: "host", output: "October 22" });
     expect(injected.filter((item: any) => item.encrypted_content).map((item: any) => item.encrypted_content)).toEqual(items.map(item => item.encrypted_content));
   });
 });
