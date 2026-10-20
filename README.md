@@ -420,6 +420,8 @@ Unencrypted inline native history drops response item `id` fields to avoid
 unsupported persisted-item lookups. Encrypted content retains its original ID
 for verification. `call_id` pairing is preserved; `item_reference` remains unsupported.
 
+Native replay accepts updated tool descriptions while retaining the current declaration. Parameter schemas, strictness and deferred-loading contracts still must match; unknown function identities and unresolved calls remain errors. Historical metadata never authorizes the host to execute a revoked tool.
+
 Current request tool declarations are injected after replayed history as native
 `additional_tools`. A re-enabled source therefore follows older discovery receipts
 and unavailable-source replies; no synthetic user reminder is inserted. Host
