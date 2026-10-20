@@ -379,6 +379,65 @@ Chat completions support standard JSON and SSE streaming responses, OpenAI funct
 
 `/v1/responses` implements the **stateless subset** of the OpenAI Responses API (the [Open Responses](https://www.openresponses.org) shape): send the full `input` item array on every call. Streaming uses semantic events (`response.output_text.delta`, `response.function_call_arguments.delta`, `response.reasoning_summary_text.delta`, …), and function tool calls round-trip via `function_call` / `function_call_output` items. No response or item history is stored, so `previous_response_id` and `item_reference` are rejected with `400` — clients must run with `store: false` semantics (for the Vercel AI SDK, pass `providerOptions: { openai: { store: false } }`).
 
+Codex usage covers every upstream response in the bridge turn, including internal
+native discovery, in both chat and Responses lanes. Exact completion reports are
+summed and take precedence over thread totals. If a completion omits usage, the
+cumulative thread total is the fallback; `last` is used only when neither exists.
+
+### Native Responses discovery (Codex)
+
+Requests using `tool_search`, `namespace`, `defer_loading`, `additional_tools`,
+or search history use a separate Responses-item path. Native schemas and history
+are injected through app-server `thread/inject_items`; they are never flattened
+into a Chat Completions transcript. Namespace descriptions, deferred schemas,
+function namespaces, search arguments, call IDs and native `encrypted_content`
+fields survive JSON and SSE replay.
+
+For client execution, declare `{ type: "tool_search", execution: "client",
+description, parameters }`. The model returns `tool_search_call`; one application
+catalog executor returns `tool_search_output` with the same `call_id`, execution
+`client`, status `completed`, and validated function/namespace definitions.
+The bridge executes no catalog search and no business function. Use the original
+authorized function executors. Do not also wrap this inventory in a framework
+`search_tools` tool or `ToolSearchProcessor`.
+
+Genuine server-executed search call/output pairs are forwarded unchanged. The
+Codex CLI 0.163.0 Luna probe instead returned an unexecuted legacy namespaced
+search call. That path fails explicitly rather than emulating hosted search or
+claiming a successful result. Client-native execution is locally verified;
+server execution requires a successful model/runtime probe before use.
+
+Native discovery currently accepts text input, `tool_choice: auto` (or omitted),
+and native reasoning effort/summary. Other tool choices, including `none`, fail
+with `400` before starting a CLI session: Codex 0.163.0 fixes upstream tool choice
+to `auto`, and removing current tools cannot disable tools loaded in history.
+It does not expose a hard output-token cap, sampling controls, stored responses,
+item references, or mixed image tools.
+Other adapters reject native discovery explicitly. Ordinary chat, function-only
+Responses, and image lanes keep their existing behavior.
+
+Unencrypted inline native history drops response item `id` fields to avoid
+unsupported persisted-item lookups. Encrypted content retains its original ID
+for verification. `call_id` pairing is preserved; `item_reference` remains unsupported.
+
+Current request tool declarations are injected after replayed history as native
+`additional_tools`. A re-enabled source therefore follows older discovery receipts
+and unavailable-source replies; no synthetic user reminder is inserted. Host
+authorization remains authoritative at function execution.
+
+Regression: `bun test tests/codex.test.ts tests/responses.test.ts`.
+Opt-in real-model smoke (uses the signed-in account, synthetic data only):
+`AGENT_BRIDGE_CODEX_SMOKE_MODEL=<model-id> bun tests/codex-native-smoke.mjs`.
+The native runner isolates `CODEX_HOME`, linking only the sign-in/model cache.
+Codex 0.163.0's [file credential store](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/login/src/auth/storage.rs)
+saves with truncate/write, so refreshes follow the auth symlink into the original
+file and survive session cleanup. No stale credential copy is written back.
+Recheck this persistence behavior before upgrading to a different storage backend
+or CLI save implementation.
+The native runner does not load profile configuration, personal MCPs or skills, and disables
+built-in web search. Custom profile model providers are outside this native lane.
+The ordinary chat lane keeps its existing configuration behavior.
+
 ### Image and file inputs
 
 The bridge accepts OpenAI's binary input shapes rather than embedding bytes in a text prompt:

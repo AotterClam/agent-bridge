@@ -15,8 +15,7 @@ import {
 } from "../src/antigravity.js";
 import { chatRequestSchema, type ChatTurn } from "../src/protocol.js";
 
-test("parses agy models output into structured specs", () => {
-  const output = `
+const modelOutput = `
 Fetching available models...
 gemini-3.7-flash-high\tGemini 3.7 Flash (High)
 gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)
@@ -33,7 +32,9 @@ claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)
 claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
 gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
 `;
-  const models = parseAgyModels(output);
+
+test("parses agy models output into structured specs", () => {
+  const models = parseAgyModels(modelOutput);
   expect(models.length).toBe(7);
 
   const flash37 = models.find((m) => m.id === "gemini-3.7-flash");
@@ -51,12 +52,13 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
 });
 
 test("resolves canonical model slugs and reasoning efforts to CLI slugs", () => {
-  expect(resolveAgyModel("gemini-3.7-flash", "low")).toBe("gemini-3.7-flash-low");
-  expect(resolveAgyModel("gemini-3.7-flash", "high")).toBe("gemini-3.7-flash-high");
-  expect(resolveAgyModel("gemini-3.7-flash")).toBe("gemini-3.7-flash-high");
-  expect(resolveAgyModel("gemini-3.1-pro")).toBe("gemini-3.1-pro-high");
-  expect(resolveAgyModel("claude-sonnet-4.6")).toBe("claude-sonnet-4-6");
-  expect(resolveAgyModel("gemini-3.7-flash-low")).toBe("gemini-3.7-flash-low");
+  const catalog = parseAgyModels(modelOutput);
+  expect(resolveAgyModel("gemini-3.7-flash", "low", catalog)).toBe("gemini-3.7-flash-low");
+  expect(resolveAgyModel("gemini-3.7-flash", "high", catalog)).toBe("gemini-3.7-flash-high");
+  expect(resolveAgyModel("gemini-3.7-flash", undefined, catalog)).toBe("gemini-3.7-flash-high");
+  expect(resolveAgyModel("gemini-3.1-pro", undefined, catalog)).toBe("gemini-3.1-pro-high");
+  expect(resolveAgyModel("claude-sonnet-4.6", undefined, catalog)).toBe("claude-sonnet-4-6");
+  expect(resolveAgyModel("gemini-3.7-flash-low", undefined, catalog)).toBe("gemini-3.7-flash-low");
 });
 
 test("resolves dynamically discovered model catalog CLI slugs", () => {

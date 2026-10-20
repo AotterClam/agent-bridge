@@ -1,3 +1,4 @@
+import { usesNativeResponses } from "./native-responses.js";
 import { createHmac, randomBytes } from "node:crypto";
 import {
   createServer,
@@ -12,7 +13,8 @@ import {
   closeCodexSessions,
   detectCodex,
   runCodex,
-  runCodexImage
+  runCodexImage,
+  runCodexResponses
 } from "./codex.js";
 import {
   closeGrokSessions,
@@ -564,8 +566,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     if (authState !== "auth_required") return failure;
     return Object.assign(failure, { status: 401, category: "auth_required" });
   };
-  const guardedRunner = (adapterId: AdapterId, run: ChatRunner): ChatRunner =>
-    async (input, runOptions) => {
+  const guardedRunner = <Input, Options, Output>(adapterId: AdapterId, run: (input: Input, options?: Options) => Promise<Output>) =>
+    async (input: Input, runOptions?: Options): Promise<Output> => {
       try {
         return await run(input, runOptions);
       } catch (error) {
@@ -777,21 +779,21 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
     const isImages = isImageGeneration || isImageEdit;
     const runtime =
       adapter === "claude"
-        ? { run: runClaude, ownedBy: "claude-code", imageCandidate: undefined }
+        ? { run: runClaude, ownedBy: "claude-code", imageCandidate: undefined, native: undefined }
         : adapter === "grok"
-          ? { run: runGrok, ownedBy: "grok", imageCandidate: runGrokImage }
+          ? { run: runGrok, ownedBy: "grok", imageCandidate: runGrokImage, native: undefined }
           : adapter === "antigravity"
-            ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined }
-            : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage };
+            ? { run: runAntigravity, ownedBy: "google", imageCandidate: undefined, native: undefined }
+            : { run: runCodex, ownedBy: "codex", imageCandidate: runCodexImage, native: runCodexResponses };
     const recordFailure = (error: unknown) => {
       logInfo.outcome = "failed";
       logInfo.errorStatus = errorStatus(error);
       logInfo.category = errorCategory(error);
       logInfo.error = error instanceof Error ? error.message : "Bridge failed";
     };
-    const runTurn: ChatRunner = async (input, runOptions) => {
+    const loggedRunner = <Input, Options, Output>(run: (input: Input, options?: Options) => Promise<Output>) => async (input: Input, runOptions?: Options) => {
       try {
-        const turn = await guardedRunner(adapter, runtime.run)(input, runOptions);
+        const turn = await guardedRunner(adapter, run)(input, runOptions);
         logInfo.outcome = "completed";
         return turn;
       } catch (error) {
@@ -799,6 +801,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         throw error;
       }
     };
+
+    const runTurn = loggedRunner(runtime.run);
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       const status = (await capabilities()).find((item) => item.id === adapter);
@@ -921,7 +925,7 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
         const usesImage = parsed.data.tools?.some(
           (tool) => tool.type === "image_generation"
         ) ?? false;
-        const chatInput = usesImage ? undefined : toChatRequest(parsed.data);
+        const chatInput = usesImage || usesNativeResponses(parsed.data) ? undefined : toChatRequest(parsed.data);
         if (chatInput) validateInputs(chatInput, adapterCapability);
         const capability = usesImage ? adapterCapability : undefined;
         const image =
@@ -952,7 +956,8 @@ export function createAgentBridge(options: AgentBridgeOptions = {}) {
             parsed.data,
             runTurn,
             controller.signal,
-            image
+            image,
+            runtime.native ? loggedRunner(runtime.native) : undefined
           ),
           response
         );

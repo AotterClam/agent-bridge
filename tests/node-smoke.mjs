@@ -37,7 +37,13 @@ createInterface({ input: process.stdin }).on("line", line => {
   if (m.id == null) return;
   const result = m.method === "model/list" ? { data: [{ model: "test" }], nextCursor: null }
     : m.method === "thread/start" ? { thread: { id: "test" } } : {};
+  if (m.method === "thread/inject_items") globalThis.native = true;
   console.log(JSON.stringify({ id: m.id, result }));
+  if (m.method === "turn/start" && globalThis.native) {
+    console.log(JSON.stringify({ method: "turn/started", params: { turn: { id: "native-turn" } } }));
+    console.log(JSON.stringify({ method: "rawResponseItem/completed", params: { item: { type: "tool_search_call", id: "native-search", call_id: "search-call", execution: "client", arguments: { query: "shipping" }, status: "completed" } } }));
+    console.log(JSON.stringify({ method: "rawResponse/completed", params: { usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } }));
+  }
 });
 `);
 await chmod(command, 0o755);
@@ -70,6 +76,31 @@ try {
   assert.equal(record.meta.status, 200);
   assert.equal(record.meta.outcome, "canceled");
   assert.equal(records.filter(r => r.scope === "http").length, 1);
+  const nativeBody = { model: "test", input: "Shipping", tools: [{ type: "tool_search", execution: "client", description: "Find shipping tools", parameters: { type: "object", properties: { query: { type: "string" } } } }] };
+  const endpoint = `http://127.0.0.1:${cancelBridge.server.address().port}/v1/responses`;
+  const rejected = await fetch(endpoint, { method: "POST", headers: { authorization: "Bearer invalid", "content-type": "application/json" }, body: JSON.stringify(nativeBody) });
+  assert.equal(rejected.status, 401);
+  const native = await fetch(endpoint, { method: "POST", headers: { authorization: `Bearer ${capabilityToken("cancel-test", "codex")}`, "content-type": "application/json" }, body: JSON.stringify(nativeBody) });
+  assert.equal(native.status, 200);
+  const payload = await native.json();
+  assert.equal(payload.output[0].type, "tool_search_call");
+  assert.equal(payload.output[0].call_id, "search-call");
+  assert.deepEqual(payload.output[0].arguments, { query: "shipping" });
+  assert.equal(payload.usage.total_tokens, 3);
+
+  const loadedHistory = [
+    { role: "user", content: "Shipping" },
+    { type: "tool_search_call", call_id: "loaded-search", execution: "client", arguments: { query: "shipping" } },
+    { type: "tool_search_output", call_id: "loaded-search", execution: "client", status: "completed", tools: [{ type: "function", name: "get_eta", parameters: { type: "object" } }] }
+  ];
+  for (const input of ["Shipping", loadedHistory]) {
+    for (const stream of [false, true]) {
+      const unsupported = await fetch(endpoint, { method: "POST", headers: { authorization: `Bearer ${capabilityToken("cancel-test", "codex")}`, "content-type": "application/json" }, body: JSON.stringify({ ...nativeBody, input, stream, tool_choice: "none" }) });
+      assert.equal(unsupported.status, 400);
+      assert.match(unsupported.headers.get("content-type"), /application\/json/);
+      assert.match((await unsupported.json()).error.message, /tool_choice auto only/);
+    }
+  }
 } finally {
   clearTimeout(timeout);
   await cancelBridge.close();
