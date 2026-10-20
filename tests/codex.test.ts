@@ -783,3 +783,21 @@ test.each([false, true])("native encrypted fields survive JSON/SSE case %# and h
     expect(injected.filter((item: any) => item.encrypted_content).map((item: any) => item.encrypted_content)).toEqual(items.map(item => item.encrypted_content));
   });
 });
+
+test("native replay permits description edits while preserving current argument contracts", () => {
+  const current = { ...shipping, tools: [{ ...shipping.tools[0]!, description: "Current data description" }] };
+  const historical = { ...shipping, tools: [{ ...shipping.tools[0]!, description: "Previous data description" }] };
+  const request = responsesRequestSchema.parse({ model: "test", tools: [nativeSearch, current], input: [
+    { type: "additional_tools", role: "developer", tools: [historical] },
+    { type: "function_call", call_id: "prior", namespace: shipping.name, name: shipping.tools[0]!.name, arguments: "{}" },
+    { type: "function_call_output", call_id: "prior", output: "prior result" },
+    { role: "user", content: "Read current data" }
+  ] });
+  const plan = nativePlan(request);
+  expect(plan.registry.get(`${shipping.name}/${shipping.tools[0]!.name}`)?.description).toBe("Current data description");
+  expect(plan.history[0]?.tools).toEqual([historical]);
+  expect(plan.currentTools).toEqual(nativePlan({ ...request, input: [] }).currentTools);
+  for (const changed of [{ parameters: { type: "object", required: ["admin"] } }, { strict: false }, { defer_loading: false }]) {
+    expect(() => nativePlan({ ...request, input: [{ type: "additional_tools", role: "developer", tools: [{ ...historical, tools: [{ ...historical.tools[0]!, ...changed }] }] }] })).toThrow("Conflicting tool schema");
+  }
+});

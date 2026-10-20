@@ -55,8 +55,9 @@ export function nativePlan(input: ResponsesRequest) {
       for (const f of functions) {
         const key = `${ns ?? ""}/${f.name}`;
         const existing = registry.get(key);
-        if (existing && !isDeepStrictEqual(existing, f)) nativeError(`Conflicting tool schema: ${key}`);
-        registry.set(key, f);
+        // Descriptions can change between turns; argument contracts cannot.
+        if (existing && !isDeepStrictEqual({ ...existing, description: undefined }, { ...f, description: undefined })) nativeError(`Conflicting tool schema: ${key}`);
+        registry.set(key, existing ?? f);
       }
     }
   };
